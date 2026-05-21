@@ -114,6 +114,26 @@ def initial_conditions(x, L, phi1_0, rho1, rho2, p_inlet, p_outlet):
                 rho1=jnp.full(N, rho1), rho2=jnp.full(N, rho2))
 
 
+def initial_conditions_slug(x, L, rho1, rho2, p_inlet, p_outlet):
+    N = len(x)
+    
+    # Step discontinuity at x = L/2
+    # Left: 80% liquid (phase 1), Right: 20% liquid
+    phi1 = jnp.where(x < L / 2, 0.8, 0.2)
+    phi2 = 1.0 - phi1
+
+    # Both phases initially at rest
+    u1 = jnp.zeros(N)
+    u2 = jnp.zeros(N)
+
+    # Linear pressure gradient to drive flow left to right
+    p = p_inlet + (p_outlet - p_inlet) * (x / L)
+
+    return dict(phi1=phi1, phi2=phi2, u1=u1, u2=u2, p=p,
+                rho1=jnp.full(N, rho1), rho2=jnp.full(N, rho2))
+
+
+
 # =============================================================================
 # SECTION 3: CFL TIME STEP
 # =============================================================================
@@ -127,7 +147,7 @@ def initial_conditions(x, L, phi1_0, rho1, rho2, p_inlet, p_outlet):
 # We use CFL=0.4 (conservative — 0.5 is the theoretical limit for
 # Lax-Friedrichs but we stay below it for safety).
 
-def compute_dt(state, dx, cfl=0.4, dt_max=1e-3):
+def compute_dt(state, dx, cfl=0.4, dt_max=1e-4):
     """
     Compute the maximum stable time step from the CFL condition.
     Wave speeds are the phase velocities plus pressure wave speed.
@@ -200,6 +220,7 @@ def advance_mass(state, dt, dx):
     rho2 = state['rho2']
     u1   = state['u1']
     u2   = state['u2']
+    p = state['p']
 
     # Conserved mass variables
     m1 = phi1 * rho1    # shape (N,)
@@ -208,6 +229,11 @@ def advance_mass(state, dt, dx):
     # Physical mass fluxes at cell centers
     F_m1 = phi1 * rho1 * u1
     F_m2 = phi2 * rho2 * u2
+    
+    eps_phi = 1e-06
+    # Zero out momentum for absent phases before computing fluxes
+    F_m2   = jnp.where(phi2 > eps_phi, phi2 * rho2 * u2, 0.0)
+    F_mom2 = jnp.where(phi2 > eps_phi, phi2 * rho2 * u2**2 + phi2 * p, 0.0)
 
     # Max wave speed for Lax-Friedrichs dissipation
     alpha = jnp.maximum(jnp.max(jnp.abs(u1)), jnp.max(jnp.abs(u2)))
@@ -216,6 +242,7 @@ def advance_mass(state, dt, dx):
     # Numerical fluxes at faces, shape (N-1,)
     f_m1 = lax_friedrichs_flux(F_m1, m1, alpha)
     f_m2 = lax_friedrichs_flux(F_m2, m2, alpha)
+    
 
     # Flux divergence at interior cells, shape (N-2,)
     # (f[1:] - f[:-1]) / dx = net flux out of each interior cell
@@ -315,6 +342,21 @@ def advance_momentum(state, dt, dx, drag_coeff):
     eps = 1e-10
     u1_star = mom1_new / (phi1_int * rho1[1:-1] + eps)
     u2_star = mom2_new / (phi2_int * rho2[1:-1] + eps)
+    
+    # setting u2_star and u1_star to zero here when volume is sufficiently small
+    eps_phi = 1e-6   # threshold below which we consider phase absent
+
+    u2_star = jnp.where(
+        phi2_int > eps_phi,                              # phase is present
+        mom2_new / (phi2_int * rho2[1:-1] + eps),       # compute velocity normally
+        0.0                                              # phase absent: force zero
+    )
+
+    u1_star = jnp.where(
+        phi1_int > eps_phi,
+        mom1_new / (phi1_int * rho1[1:-1] + eps),
+        0.0
+    )
 
     return u1_star, u2_star
 
@@ -520,8 +562,35 @@ def project_velocities(u1_star, u2_star, dp, phi1, phi2, rho1, rho2, dx, dt):
     eps = 1e-10
     u1_new = u1_star - (dt / (rho1 + eps)) * dp_dx
     u2_new = u2_star - (dt / (rho2 + eps)) * dp_dx
+    
+    # again zeroing out the velocity when below eps_phi
+    eps_phi = 1e-6    # threshold below which we consider phase absent
+    u1_new = jnp.where(
+        phi1 > eps_phi,
+        u1_star - (dt / (rho1 + eps)) * dp_dx,
+        0.0
+    )
+
+    u2_new = jnp.where(
+        phi2 > eps_phi,
+        u2_star - (dt / (rho2 + eps)) * dp_dx,
+        0.0
+    )
 
     return u1_new, u2_new
+
+# function to only recover velocity where phase is presentt, otherwise return zero without division
+# prevents divide by zero issues when phi is really small
+def safe_velocity(mom, phi, rho, eps_phi=1e-6):
+    """
+    Only recover velocity where phase is present.
+    Everywhere else return zero without division.
+    """
+    return jnp.where(
+        phi > eps_phi,
+        mom / (phi * rho + 1e-10),
+        0.0
+    )
 
 
 # =============================================================================
@@ -684,14 +753,15 @@ if __name__ == "__main__":
     N        = 100      # number of cells
     rho1_val = 1000.0   # density of phase 1 (e.g. water) [kg/m³]
     rho2_val = 1.0      # density of phase 2 (e.g. air)   [kg/m³]
-    phi1_0   = 0.7      # initial volume fraction of phase 1
+    phi1_0   = 1.0     # initial volume fraction of phase 1
     p_inlet  = 1.01e5   # inlet pressure [Pa]  (slightly above atmospheric)
     p_outlet = 1.00e5   # outlet pressure [Pa] (atmospheric)
-    drag_coeff = 50.0   # inter-phase drag coefficient [kg/(m³·s)]
-    t_end    = 2.0      # simulation end time [s]
+    drag_coeff = 0.0  # inter-phase drag coefficient [kg/(m³·s)]
+    t_end    = 5.0      # simulation end time [s]
 
     # --- Grid ---
     dx, x = make_grid(L, N)
+
 
     # --- Initial conditions ---
     state = initial_conditions(
@@ -699,6 +769,14 @@ if __name__ == "__main__":
         rho1_val, rho2_val,
         p_inlet, p_outlet
     )
+    
+    '''
+    # --- Initial conditions for slug verification problem ---
+    state = initial_conditions_slug(
+        x, L, rho1_val, rho2_val,
+        p_inlet, p_outlet
+    )
+    '''    
 
     print("=" * 60)
     print("1D Two-Phase Mixture Flow Solver")
@@ -721,11 +799,13 @@ if __name__ == "__main__":
     )
 
     # --- Storage for output ---
-    save_every  = 500    # save state every N steps
+    save_every  = 2000    # save state every N steps
     saved_times = []
     saved_phi1  = []
     saved_u1    = []
     saved_u2    = []
+    
+    saved_phi2 = []
 
     # --- Time loop ---
     t      = 0.0
@@ -754,6 +834,8 @@ if __name__ == "__main__":
             saved_phi1.append(np.array(state['phi1']))
             saved_u1.append(np.array(state['u1']))
             saved_u2.append(np.array(state['u2']))
+            
+            saved_phi2.append(np.array(state['phi2']))
 
     print(f"\nDone. {step_n} steps completed.")
     
@@ -816,4 +898,4 @@ if __name__ == "__main__":
 #
 # RK2 is second-order accurate (error ~ dt²) vs Euler's first-order (error ~ dt).
 # This means you can use larger dt for the same accuracy, or get much better
-# accuracy at the same dt. The cost is two RHS evaluations per step instead of one.M
+# accuracy at the same dt. The cost is two RHS evaluations per step instead of one.
