@@ -107,6 +107,15 @@ def initial_conditions(x, L, phi1_0, rho1, rho2, p_inlet, p_outlet):
     u2   = jnp.zeros(N)
 
     # Linear pressure profile: high at inlet, low at outlet
+    phi2_min = 1e-4
+    #phi2_min = 7.5e-4
+    phi1     = jnp.full(N, phi1_0)
+    phi2     = jnp.maximum(1.0 - phi1, phi2_min)
+    phi1     = 1.0 - phi2    # re-normalize so phi1 + phi2 = 1 exactly
+
+    u1 = jnp.zeros(N)
+    u2 = jnp.zeros(N)
+
     # This is the driving force for the flow
     p    = p_inlet + (p_outlet - p_inlet) * (x / L)
 
@@ -753,11 +762,11 @@ if __name__ == "__main__":
     N        = 100      # number of cells
     rho1_val = 1000.0   # density of phase 1 (e.g. water) [kg/m³]
     rho2_val = 1.0      # density of phase 2 (e.g. air)   [kg/m³]
-    phi1_0   = 1.0     # initial volume fraction of phase 1
+    phi1_0   = 1.0   # initial volume fraction of phase 1
     p_inlet  = 1.01e5   # inlet pressure [Pa]  (slightly above atmospheric)
     p_outlet = 1.00e5   # outlet pressure [Pa] (atmospheric)
-    drag_coeff = 0.0  # inter-phase drag coefficient [kg/(m³·s)]
-    t_end    = 5.0      # simulation end time [s]
+    drag_coeff = 50.0  # inter-phase drag coefficient [kg/(m³·s)]
+    t_end    = 2.0      # simulation end time [s]
 
     # --- Grid ---
     dx, x = make_grid(L, N)
