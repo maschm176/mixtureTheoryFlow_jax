@@ -615,47 +615,43 @@ def safe_velocity(mom, phi, rho, eps_phi=1e-6):
 #
 # JAX arrays are immutable, so .at[].set() returns a NEW array.
 # This is not in-place mutation — JAX traces these as functional updates.
-
-def apply_boundary_conditions(state, phi1_int, phi2_int, u1_int, u2_int,
-                               p_inlet, p_outlet):
-    """
-    Pad interior arrays (N-2,) with boundary values to produce full (N,) arrays.
     
-    Interior arrays come from the PDE solve (Steps 1-4).
-    Boundary cells are set from BCs.
-    """
-    N = len(state['phi1'])   # total cells including boundaries
-
-    # --- Volume fractions ---
-    # Interior values from mass advance; boundaries from zero-gradient
-    phi1 = jnp.concatenate([phi1_int[:1],    # inlet: copy first interior
-                             phi1_int,
-                             phi1_int[-1:]])  # outlet: copy last interior
-
-    # Step 5: algebraic cleanup — enforce volume constraint
-    # After projecting pressure and advancing mass independently,
-    # small numerical errors may cause φ₁ + φ₂ ≠ 1 exactly.
-    # We enforce it by defining φ₂ = 1 - φ₁ (phase 1 is "primary").
-    phi2 = 1.0 - phi1
-
-    # --- Velocities ---
-    u1 = jnp.concatenate([u1_int[:1],    # inlet: zero-gradient
-                           u1_int,
-                           u1_int[-1:]])  # outlet: zero-gradient
-
-    u2 = jnp.concatenate([u2_int[:1],
-                           u2_int,
-                           u2_int[-1:]])
-
-    # --- Pressure ---
-    # Interior pressure from previous step (we don't re-solve p everywhere,
-    # only the correction dp); boundaries are fixed BCs
-    p_int = state['p'][1:-1]   # keep interior pressure from last step
-
+def apply_boundary_conditions(state, phi1_int, phi2_int,
+                               u1_int, u2_int, p_inlet, p_outlet,
+                               phi1_inlet=0.95, phi2_min=1e-4):
+    
+    # Interior volume fractions
+    phi1_interior = phi1_int
+    phi2_interior = phi2_int
+    
+    # Inlet boundary: fix to initial composition
+    # This represents fresh sludge entering at constant composition
+    phi1_inlet_val = jnp.array([phi1_inlet])
+    phi2_inlet_val = jnp.array([1.0 - phi1_inlet])
+    
+    # Outlet boundary: zero-gradient (let whatever is there exit freely)
+    phi1_outlet_val = phi1_int[-1:]
+    phi2_outlet_val = phi2_int[-1:]
+    
+    # Assemble full arrays
+    phi1 = jnp.concatenate([phi1_inlet_val, phi1_interior, phi1_outlet_val])
+    phi2 = jnp.concatenate([phi2_inlet_val, phi2_interior, phi2_outlet_val])
+    
+    # Apply floor and re-normalize
+    phi2 = jnp.maximum(phi2, phi2_min)
+    phi1 = 1.0 - phi2
+    
+    # Velocities — inlet: fix to zero-gradient but also
+    # clamp u2 at inlet to prevent boundary blowup
+    u1 = jnp.concatenate([u1_int[:1], u1_int, u1_int[-1:]])
+    u2 = jnp.concatenate([u2_int[:1], u2_int, u2_int[-1:]])
+    
+    # Pressure
+    p_int = state['p'][1:-1]
     p = jnp.concatenate([jnp.array([p_inlet]),
                           p_int,
                           jnp.array([p_outlet])])
-
+    
     return dict(phi1=phi1, phi2=phi2, u1=u1, u2=u2, p=p,
                 rho1=state['rho1'], rho2=state['rho2'])
 
@@ -666,7 +662,8 @@ def apply_boundary_conditions(state, phi1_int, phi2_int, u1_int, u2_int,
 # Combines all steps into one function that advances the state by dt.
 # This is the function JAX will JIT-compile into a single XLA kernel.
 
-def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet):
+#def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet):
+def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet, phi1_inlet=0.95):
     """
     Advance the simulation state by one time step dt.
 
@@ -703,9 +700,13 @@ def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet):
     )
 
     # Step 5: apply BCs and volume fraction cleanup
+    #new_state = apply_boundary_conditions(
+    #    state, phi1_int, phi2_int, u1_int, u2_int,
+    #    p_inlet, p_outlet
+    #) 
     new_state = apply_boundary_conditions(
         state, phi1_int, phi2_int, u1_int, u2_int,
-        p_inlet, p_outlet
+        p_inlet, p_outlet, phi1_inlet=phi1_inlet
     )
 
     return new_state
@@ -756,8 +757,8 @@ def compute_diagnostics(state, dx):
 # =============================================================================
 
 if __name__ == "__main__":
-
-    # --- Physical parameters ---
+    '''
+    # --- Physical parameters --- 
     L        = 1.0      # pipe length [m]
     N        = 100      # number of cells
     rho1_val = 1000.0   # density of phase 1 (e.g. water) [kg/m³]
@@ -767,6 +768,18 @@ if __name__ == "__main__":
     p_outlet = 1.00e5   # outlet pressure [Pa] (atmospheric)
     drag_coeff = 50.0  # inter-phase drag coefficient [kg/(m³·s)]
     t_end    = 2.0      # simulation end time [s]
+    '''
+    # --- Sludge parameters ---
+    L          = 1.0      # pipe length [m]
+    N          = 100      # number of cells
+    rho1_val   = 1000.0   # water [kg/m³]
+    rho2_val   = 1050.0   # suspended solids [kg/m³]
+    phi1_0     = 0.95     # 95% water
+    p_inlet    = 1.5e5    # [Pa]
+    p_outlet   = 1.0e5    # [Pa]
+    drag_coeff = 5000.0   # [kg/(m³·s)]
+    t_end      = 2.0      # [s]
+    #dt_max     = 1e-4
 
     # --- Grid ---
     dx, x = make_grid(L, N)
@@ -803,12 +816,17 @@ if __name__ == "__main__":
     # kernel, and then every subsequent call runs the compiled version.
     # This is why JAX is fast — after the first step, there's no Python
     # overhead in the time loop at all.
+    #step_jit = jax.jit(
+    #    lambda s, dt: time_step(s, dt, dx, drag_coeff, p_inlet, p_outlet)
+    #)
+    
     step_jit = jax.jit(
-        lambda s, dt: time_step(s, dt, dx, drag_coeff, p_inlet, p_outlet)
+    lambda s, dt: time_step(s, dt, dx, drag_coeff, 
+                             p_inlet, p_outlet, phi1_0)
     )
 
     # --- Storage for output ---
-    save_every  = 2000    # save state every N steps
+    save_every  = 1000   # save state every N steps
     saved_times = []
     saved_phi1  = []
     saved_u1    = []
@@ -834,17 +852,47 @@ if __name__ == "__main__":
         if step_n % save_every == 0:
             diag = compute_diagnostics(state, dx)
             print(f"  t={t:.4f}s  step={step_n:5d}  "
-                  f"dt={dt:.2e}  "
-                  f"vol_err={diag['vol_error']:.2e}  "
-                  f"max|u1|={diag['max_u1']:.4f}  "
-                  f"max|u2|={diag['max_u2']:.4f}")
-
+                f"dt={dt:.2e}  "
+                f"vol_err={diag['vol_error']:.2e}  "
+                f"max|u1|={diag['max_u1']:.4f}  "
+                f"max|u2|={diag['max_u2']:.4f}")
+        
             saved_times.append(t)
             saved_phi1.append(np.array(state['phi1']))
             saved_u1.append(np.array(state['u1']))
             saved_u2.append(np.array(state['u2']))
             
             saved_phi2.append(np.array(state['phi2']))
+
+        '''
+        # Add this — print dp diagnostic for first 5 steps
+        # Check for blowup every step — stop when it first appears
+        u2_max = float(jnp.max(jnp.abs(state['u2'])))
+        u1_max = float(jnp.max(jnp.abs(state['u1'])))
+        
+        if u2_max > 10.0 * u1_max:   # u2 more than 10x u1 — something wrong
+            print(f"\nBLOWUP DETECTED at step={step_n} t={t:.6f}")
+            print(f"  u1_max = {u1_max:.4e}")
+            print(f"  u2_max = {u2_max:.4e}")
+            print(f"  dt     = {dt:.4e}")
+            print(f"  phi2:  min={float(state['phi2'].min()):.6f} "
+                f"max={float(state['phi2'].max()):.6f}")
+            print(f"  phi1:  min={float(state['phi1'].min()):.6f} "
+                f"max={float(state['phi1'].max()):.6f}")
+            
+            
+            # Print the spatial profile of u2 at blowup
+            print(f"\n  u2 profile at blowup:")
+            u2_arr = jnp.abs(state['u2'])
+            worst_idx = int(jnp.argmax(u2_arr))
+            print(f"  worst cell: index={worst_idx} "
+                f"x={float(x[worst_idx]):.3f}m "
+                f"u2={float(state['u2'][worst_idx]):.4e}")
+            break
+        '''
+        
+        
+
 
     print(f"\nDone. {step_n} steps completed.")
     
