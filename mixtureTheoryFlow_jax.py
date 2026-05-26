@@ -339,8 +339,16 @@ def advance_momentum(state, dt, dx, drag_coeff):
     phi1_int = phi1[1:-1]
     phi2_int = phi2[1:-1]
 
-    M1 =  drag_coeff * phi1_int * phi2_int * (u2_int - u1_int)
-    M2 = -M1
+    delta_u = u2_int - u1_int
+    # just using these values to test C_d sensitivity and see if we can get the expected behavior of the slug flow development
+    drag_coeff = 0.44   # C_D, dimensionless (e.g. 0.44 for large Re)
+    d_b        = 1e-3   # bubble diameter [m]
+
+    #M1 =  drag_coeff * phi1_int * phi2_int * (u2_int - u1_int)
+    #M1 =  0.75 * drag_coeff * phi1_int * phi2_int * rho1_0 * (u2_int - u1_int) * jnp.magnitude(u2_int - u1_int)
+    M1 =  drag_coeff * (3.0/4.0) * (phi2_int * phi1_int * rho1[1:-1] / d_b) * jnp.abs(delta_u) * delta_u
+    M2= -M1
+    
 
     # Advance conserved momentum, shape (N-2,)
     mom1_new = mom1[1:-1] - dt * div_mom1 + dt * p_int * dphi1_dx + dt * M1
@@ -775,10 +783,10 @@ if __name__ == "__main__":
     rho1_val   = 1000.0   # water [kg/m³]
     rho2_val   = 1050.0   # suspended solids [kg/m³]
     phi1_0     = 0.95     # 95% water
-    p_inlet    = 1.5e5    # [Pa]
-    p_outlet   = 1.0e5    # [Pa]
-    drag_coeff = 5000.0   # [kg/(m³·s)]
-    t_end      = 2.0      # [s]
+    p_inlet    = 1.01e5    # [Pa]
+    p_outlet   = 1.0000e5    # [Pa]
+    drag_coeff = 50000.0   # [kg/(m³·s)]
+    t_end      = 6.0      # [s]
     #dt_max     = 1e-4
 
     # --- Grid ---
@@ -826,7 +834,7 @@ if __name__ == "__main__":
     )
 
     # --- Storage for output ---
-    save_every  = 1000   # save state every N steps
+    save_every  = 5000   # save state every N steps
     saved_times = []
     saved_phi1  = []
     saved_u1    = []
@@ -863,6 +871,13 @@ if __name__ == "__main__":
             saved_u2.append(np.array(state['u2']))
             
             saved_phi2.append(np.array(state['phi2']))
+            
+            # Add to time loop
+            if step_n % save_every == 0:
+                print(f"phi1 min={float(state['phi1'].min()):.6f} "
+                    f"phi1 max={float(state['phi1'].max()):.6f} "
+                    f"phi2 min={float(state['phi2'].min()):.6f} "
+                    f"phi2 max={float(state['phi2'].max()):.6f}")
 
         '''
         # Add this — print dp diagnostic for first 5 steps
