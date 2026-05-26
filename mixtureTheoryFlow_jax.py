@@ -294,7 +294,7 @@ def advance_mass(state, dt, dx):
 # These are INTERMEDIATE velocities u* — not yet volume-conserving.
 # The pressure projection in Step 3 will correct them.
 
-def advance_momentum(state, dt, dx, drag_coeff):
+def advance_momentum(state, dt, dx, drag_coeff, d_b):
     """
     Advance momentum equations for both phases (intermediate step).
     Returns intermediate velocities u1_star, u2_star (interior, shape N-2).
@@ -328,50 +328,88 @@ def advance_momentum(state, dt, dx, drag_coeff):
     div_mom2 = (f_mom2[1:] - f_mom2[:-1]) / dx
 
     # Non-conservative pressure term: p * d(phi)/dx
-    # Central difference for phi gradient at interior cells
     dphi1_dx = (phi1[2:] - phi1[:-2]) / (2.0 * dx)   # shape (N-2,)
     dphi2_dx = (phi2[2:] - phi2[:-2]) / (2.0 * dx)
     p_int    = p[1:-1]                                  # shape (N-2,)
 
-    # Inter-phase drag source terms (Newton's 3rd law: M1 + M2 = 0)
-    u1_int = u1[1:-1]
-    u2_int = u2[1:-1]
+    # Interior values
+    u1_int   = u1[1:-1]
+    u2_int   = u2[1:-1]
     phi1_int = phi1[1:-1]
     phi2_int = phi2[1:-1]
 
-    delta_u = u2_int - u1_int
-    # just using these values to test C_d sensitivity and see if we can get the expected behavior of the slug flow development
-    drag_coeff = 0.44   # C_D, dimensionless (e.g. 0.44 for large Re)
-    d_b        = 1e-3   # bubble diameter [m]
+    # --- Inter-phase drag ---
+    delta_u    = u2_int - u1_int
+    #drag_coeff = 0.44
+    #d_b        = 1e-3
 
-    #M1 =  drag_coeff * phi1_int * phi2_int * (u2_int - u1_int)
-    #M1 =  0.75 * drag_coeff * phi1_int * phi2_int * rho1_0 * (u2_int - u1_int) * jnp.magnitude(u2_int - u1_int)
-    M1 =  drag_coeff * (3.0/4.0) * (phi2_int * phi1_int * rho1[1:-1] / d_b) * jnp.abs(delta_u) * delta_u
-    M2= -M1
-    
+    M1 = drag_coeff * (3.0/4.0) * (phi2_int * phi1_int * rho1[1:-1] / d_b) \
+         * jnp.abs(delta_u) * delta_u
+    M2 = -M1
 
-    # Advance conserved momentum, shape (N-2,)
-    mom1_new = mom1[1:-1] - dt * div_mom1 + dt * p_int * dphi1_dx + dt * M1
-    mom2_new = mom2[1:-1] - dt * div_mom2 + dt * p_int * dphi2_dx + dt * M2
+    # --- Wall friction (Darcy-Weisbach) ---
+    # Resists bulk mixture motion against the pipe wall.
+    # This is what allows the flow to reach steady state —
+    # without it, the pressure gradient accelerates the mixture forever.
+    #
+    # F_wall = -(f / 2D) * rho_mix * u_mix * |u_mix|
+    #
+    # We compute the mixture velocity as the momentum-weighted average
+    # of the two phase velocities, then apply friction to each phase
+    # proportional to its volume fraction.
+    #
+    # The negative sign is critical — friction always opposes flow direction.
+    # jnp.abs(u_mix) * u_mix gives u² with the correct sign.
 
-    # Recover intermediate velocities from conserved momentum
-    # Small epsilon in denominator prevents division by zero when phi → 0
-    eps = 1e-10
-    u1_star = mom1_new / (phi1_int * rho1[1:-1] + eps)
-    u2_star = mom2_new / (phi2_int * rho2[1:-1] + eps)
-    
-    # setting u2_star and u1_star to zero here when volume is sufficiently small
-    eps_phi = 1e-6   # threshold below which we consider phase absent
+    f_darcy = 0.02    # Darcy friction factor (dimensionless)
+                      # 0.01-0.02 typical for turbulent pipe flow
+                      # 64/Re for laminar flow (Re = rho*u*D/mu)
+    D       = 0.1     # pipe diameter [m]
 
-    u2_star = jnp.where(
-        phi2_int > eps_phi,                              # phase is present
-        mom2_new / (phi2_int * rho2[1:-1] + eps),       # compute velocity normally
-        0.0                                              # phase absent: force zero
-    )
+    # Momentum-weighted mixture velocity at interior cells
+    rho1_int = rho1[1:-1]
+    rho2_int = rho2[1:-1]
+
+    rho_mix = phi1_int * rho1_int + phi2_int * rho2_int
+    u_mix   = (phi1_int * rho1_int * u1_int + phi2_int * rho2_int * u2_int) \
+              / (rho_mix + 1e-10)
+
+    # Friction force per unit volume on the mixture
+    F_friction = -(f_darcy / (2.0 * D)) * rho_mix * u_mix * jnp.abs(u_mix)
+
+    # Distribute friction to each phase by volume fraction
+    # Each phase feels friction in proportion to how much of the
+    # pipe cross-section it occupies
+    friction1 = phi1_int * F_friction
+    friction2 = phi2_int * F_friction
+
+    # --- Advance conserved momentum ---
+    # All source terms combined: drag + wall friction
+    mom1_new = (mom1[1:-1]
+                - dt * div_mom1
+                + dt * p_int * dphi1_dx
+                + dt * M1
+                + dt * friction1)          # ← wall friction added here
+
+    mom2_new = (mom2[1:-1]
+                - dt * div_mom2
+                + dt * p_int * dphi2_dx
+                + dt * M2
+                + dt * friction2)          # ← wall friction added here
+
+    # --- Recover intermediate velocities ---
+    eps     = 1e-10
+    eps_phi = 1e-6
 
     u1_star = jnp.where(
         phi1_int > eps_phi,
-        mom1_new / (phi1_int * rho1[1:-1] + eps),
+        mom1_new / (phi1_int * rho1_int + eps),
+        0.0
+    )
+
+    u2_star = jnp.where(
+        phi2_int > eps_phi,
+        mom2_new / (phi2_int * rho2_int + eps),
         0.0
     )
 
@@ -671,7 +709,7 @@ def apply_boundary_conditions(state, phi1_int, phi2_int,
 # This is the function JAX will JIT-compile into a single XLA kernel.
 
 #def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet):
-def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet, phi1_inlet=0.95):
+def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet, d_b, phi1_inlet=0.95):
     """
     Advance the simulation state by one time step dt.
 
@@ -689,7 +727,7 @@ def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet, phi1_inlet=0.95):
     phi1_int, phi2_int = advance_mass(state, dt, dx)
 
     # Step 2: advance momentum (intermediate velocities)
-    u1_star, u2_star = advance_momentum(state, dt, dx, drag_coeff)
+    u1_star, u2_star = advance_momentum(state, dt, dx, drag_coeff, d_b)
 
     # Step 3: pressure Poisson solve for volume conservation
     dp = pressure_poisson_solve(
@@ -785,7 +823,9 @@ if __name__ == "__main__":
     phi1_0     = 0.95     # 95% water
     p_inlet    = 1.01e5    # [Pa]
     p_outlet   = 1.0000e5    # [Pa]
-    drag_coeff = 50000.0   # [kg/(m³·s)]
+    #drag_coeff = 50000.0   # [kg/(m³·s)]
+    drag_coeff = 0.44     # [kg/(m³·s)] — use with the new drag model
+    d_b       = 1e-3     # effective particle diameter for drag [m]
     t_end      = 6.0      # [s]
     #dt_max     = 1e-4
 
@@ -830,7 +870,7 @@ if __name__ == "__main__":
     
     step_jit = jax.jit(
     lambda s, dt: time_step(s, dt, dx, drag_coeff, 
-                             p_inlet, p_outlet, phi1_0)
+                             p_inlet, p_outlet, d_b, phi1_0)
     )
 
     # --- Storage for output ---
