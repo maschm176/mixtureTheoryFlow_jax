@@ -156,18 +156,28 @@ def initial_conditions_slug(x, L, rho1, rho2, p_inlet, p_outlet):
 # We use CFL=0.4 (conservative — 0.5 is the theoretical limit for
 # Lax-Friedrichs but we stay below it for safety).
 
-def compute_dt(state, dx, cfl=0.4, dt_max=1e-4):
+def compute_dt(state, dx, mu1, mu2, rho1_val, rho2_val, cfl=0.4, dt_max=1e-4):
+            
     """
     Compute the maximum stable time step from the CFL condition.
     Wave speeds are the phase velocities plus pressure wave speed.
     For incompressible phases we use max(|u1|, |u2|) as a proxy.
     """
+    eps_phi = 1e-6
+    
     max_speed = jnp.maximum(
         jnp.max(jnp.abs(state['u1'])),
-        jnp.max(jnp.abs(state['u2']))
-    )
+        jnp.max(jnp.abs(state['u2'])))
+    
     max_speed = jnp.maximum(max_speed, 1e-6)
     dt_cfl = cfl * dx / max_speed
+    
+    # checking viscous stability conditions as well, where nu = mu/rho_val
+    nu_max  = max(mu1/rho1_val, mu2/rho2_val)
+    dt_visc = 0.5 * dx**2 / nu_max
+    
+    dt_cfl = jnp.minimum(dt_cfl,  dt_visc)
+    
     return jnp.minimum(dt_cfl, dt_max)   # never exceed dt_max
 
 
@@ -287,6 +297,9 @@ def advance_mass(state, dt, dx):
 # extra term. It ensures the sum of all phase momentum equations gives
 # the correct mixture momentum equation.
 #
+#      ∇·τ_α  : viscous stress — φ_α μ_α ∂²u_α/∂x²
+#     φ_α ρ_α g : gravity body force along pipe axis
+#
 # M_α is the inter-phase drag: M₁ = C_d φ₁ φ₂ (u₂ - u₁), M₂ = -M₁
 # The drag is proportional to the volume fractions of both phases
 # (more drag when both phases are present) and the velocity difference.
@@ -294,7 +307,7 @@ def advance_mass(state, dt, dx):
 # These are INTERMEDIATE velocities u* — not yet volume-conserving.
 # The pressure projection in Step 3 will correct them.
 
-def advance_momentum(state, dt, dx, drag_coeff, d_b):
+def advance_momentum(state, dt, dx, drag_coeff, d_b, mu1, mu2, theta):
     """
     Advance momentum equations for both phases (intermediate step).
     Returns intermediate velocities u1_star, u2_star (interior, shape N-2).
@@ -306,22 +319,30 @@ def advance_momentum(state, dt, dx, drag_coeff, d_b):
     u1   = state['u1']
     u2   = state['u2']
     p    = state['p']
+    
+    eps_phi = 1e-6
 
     # Conserved momentum variables
     mom1 = phi1 * rho1 * u1
-    mom2 = phi2 * rho2 * u2
+    u2_safe = jnp.where(phi2 > eps_phi, u2, 0.0)
+    mom2 = phi2 * rho2 * u2_safe
 
     # Physical momentum fluxes (convection + pressure)
     F_mom1 = phi1 * rho1 * u1**2 + phi1 * p
-    F_mom2 = phi2 * rho2 * u2**2 + phi2 * p
+    #F_mom2 = phi2 * rho2 * u2**2 + phi2 * p
+    F_mom2 = jnp.where(phi2 > eps_phi,
+                    phi2 * rho2 * u2**2 + phi2 * p,
+                    0.0)
 
     # Max wave speed
     alpha = jnp.maximum(jnp.max(jnp.abs(u1)), jnp.max(jnp.abs(u2)))
     alpha = jnp.maximum(alpha, 1e-6)
+    
+    mom2_safe = jnp.where(phi2 > eps_phi, mom2, 0.0)
 
     # Numerical fluxes at faces, shape (N-1,)
     f_mom1 = lax_friedrichs_flux(F_mom1, mom1, alpha)
-    f_mom2 = lax_friedrichs_flux(F_mom2, mom2, alpha)
+    f_mom2 = lax_friedrichs_flux(F_mom2, mom2_safe, alpha)
 
     # Flux divergence at interior cells, shape (N-2,)
     div_mom1 = (f_mom1[1:] - f_mom1[:-1]) / dx
@@ -337,7 +358,29 @@ def advance_momentum(state, dt, dx, drag_coeff, d_b):
     u2_int   = u2[1:-1]
     phi1_int = phi1[1:-1]
     phi2_int = phi2[1:-1]
+    rho1_int = rho1[1:-1]
+    rho2_int = rho2[1:-1]
+    
+    
+    # --- Calculating the viscous stress ---
+    # calculate second derivative of velocity for each phase using central difference
+    d2u1_dx2 = (u1[2:] - 2.0*u1[1:-1] + u1[:-2]) / dx**2
+    d2u2_dx2 = (u2[2:] - 2.0*u2[1:-1] + u2[:-2]) / dx**2
 
+    # using second derivative of velocity to compute viscous stress for each phase
+    visc1 = phi1_int * mu1 * d2u1_dx2
+    visc2 = phi2_int * mu2 * d2u2_dx2
+    
+    # --- Gravity Term ---
+    g     = 9.81    # [m/s²]
+    # Gravity component along pipe axis
+    # Positive θ means flow going uphill — gravity opposes flow
+    # Negative θ means flow going downhill — gravity assists flow
+    g_x = -g * jnp.sin(theta)   # negative because gravity opposes upward flow
+
+    grav1 = phi1_int * rho1[1:-1] * g_x
+    grav2 = phi2_int * rho2[1:-1] * g_x
+    
     # --- Inter-phase drag ---
     delta_u    = u2_int - u1_int
     #drag_coeff = 0.44
@@ -364,7 +407,7 @@ def advance_momentum(state, dt, dx, drag_coeff, d_b):
     f_darcy = 0.02    # Darcy friction factor (dimensionless)
                       # 0.01-0.02 typical for turbulent pipe flow
                       # 64/Re for laminar flow (Re = rho*u*D/mu)
-    D       = 0.1     # pipe diameter [m]
+    D       = 0.038     # pipe diameter [m]
 
     # Momentum-weighted mixture velocity at interior cells
     rho1_int = rho1[1:-1]
@@ -386,17 +429,25 @@ def advance_momentum(state, dt, dx, drag_coeff, d_b):
     # --- Advance conserved momentum ---
     # All source terms combined: drag + wall friction
     mom1_new = (mom1[1:-1]
-                - dt * div_mom1
-                + dt * p_int * dphi1_dx
-                + dt * M1
-                + dt * friction1)          # ← wall friction added here
+                - dt * div_mom1     
+                + dt * p_int * dphi1_dx # pressure gradient term
+                + dt * visc1            # viscous stress
+                + dt * grav1            # gravitational force
+                + dt * M1               # interphase drag term
+                + dt * friction1)       # wall friction term         
 
     mom2_new = (mom2[1:-1]
                 - dt * div_mom2
-                + dt * p_int * dphi2_dx
-                + dt * M2
-                + dt * friction2)          # ← wall friction added here
-
+                + dt * p_int * dphi2_dx # pressure gradient term
+                + dt * visc2            # viscous stress
+                + dt * grav2            # gravitational force
+                + dt * M2               # interphase drag term
+                + dt * friction2)       # wall friction term
+    
+    
+    '''
+    # before were recovering intermediate velcoities here, but instead we will just return the updated momentum, 
+    # and recover velocities after the pressure projection step, 
     # --- Recover intermediate velocities ---
     eps     = 1e-10
     eps_phi = 1e-6
@@ -412,8 +463,13 @@ def advance_momentum(state, dt, dx, drag_coeff, d_b):
         mom2_new / (phi2_int * rho2_int + eps),
         0.0
     )
+    '''
+    
+    # Zero out momentum where phase 2 is absent
+    mom2_new = jnp.where(phi2_int > eps_phi, mom2_new, 0.0)
 
-    return u1_star, u2_star
+    #return u1_star, u2_star
+    return mom1_new, mom2_new
 
 
 # =============================================================================
@@ -709,7 +765,7 @@ def apply_boundary_conditions(state, phi1_int, phi2_int,
 # This is the function JAX will JIT-compile into a single XLA kernel.
 
 #def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet):
-def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet, d_b, phi1_inlet=0.95):
+def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet, d_b, mu1, mu2, theta, phi1_inlet=0.95):
     """
     Advance the simulation state by one time step dt.
 
@@ -727,7 +783,21 @@ def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet, d_b, phi1_inlet=0.95
     phi1_int, phi2_int = advance_mass(state, dt, dx)
 
     # Step 2: advance momentum (intermediate velocities)
-    u1_star, u2_star = advance_momentum(state, dt, dx, drag_coeff, d_b)
+    mom1_new, mom2_new = advance_momentum(state, dt, dx, drag_coeff, d_b, mu1, mu2, theta)
+    
+    # calculate intermediate velocities from momentum, avoiding division by zero when phase is absent
+    eps_phi = 1e-6
+    eps     = 1e-10
+
+    u1_star = jnp.where(
+        phi1_int > eps_phi,
+        mom1_new / (phi1_int * rho1_int + eps),
+        0.0)
+
+    u2_star = jnp.where(
+        phi2_int > eps_phi,
+        mom2_new / (phi2_int * rho2_int + eps),
+        0.0)
 
     # Step 3: pressure Poisson solve for volume conservation
     dp = pressure_poisson_solve(
@@ -814,7 +884,7 @@ if __name__ == "__main__":
     p_outlet = 1.00e5   # outlet pressure [Pa] (atmospheric)
     drag_coeff = 50.0  # inter-phase drag coefficient [kg/(m³·s)]
     t_end    = 2.0      # simulation end time [s]
-    '''
+    
     # --- Sludge parameters ---
     L          = 1.0      # pipe length [m]
     N          = 100      # number of cells
@@ -828,7 +898,26 @@ if __name__ == "__main__":
     d_b       = 1e-3     # effective particle diameter for drag [m]
     t_end      = 6.0      # [s]
     #dt_max     = 1e-4
-
+    '''
+        
+    # --- Oil (EXXSOL D140) parameters ---
+    L          = 1.0      # pipe length [m]
+    D          = 0.038    # pipe diameter [m] — matches their 38mm test section
+    N          = 100      # number of cells
+    theta      = 0.0     # pipe inclination angle from horizontal [radians], # 0 = horizontal, π/2 = vertical
+    rho1_val   = 1000.0   # water [kg/m³]
+    rho2_val   = 828.0   # oil [kg/m³]
+    phi1_0     = 0.90     # 70% water
+    p_inlet    = 1.01e5    # [Pa]
+    p_outlet   = 1.0000e5    # [Pa]
+    mu1        = 1e-3     # water [Pa·s]
+    mu2        = 6e-3     # oil [Pa·s]
+    #drag_coeff = 50000.0   # [kg/(m³·s)]
+    drag_coeff = 0.44     # [kg/(m³·s)] — use with the new drag model
+    d_b       = 1e-3     # effective particle diameter for drag [m]
+    t_end      = 6.0      # [s]
+    #dt_max     = 1e-4
+    
     # --- Grid ---
     dx, x = make_grid(L, N)
 
@@ -870,7 +959,7 @@ if __name__ == "__main__":
     
     step_jit = jax.jit(
     lambda s, dt: time_step(s, dt, dx, drag_coeff, 
-                             p_inlet, p_outlet, d_b, phi1_0)
+                             p_inlet, p_outlet, d_b, mu1, mu2, theta, phi1_0)
     )
 
     # --- Storage for output ---
@@ -888,10 +977,12 @@ if __name__ == "__main__":
 
     while t < t_end:
         # Compute stable dt from CFL condition (adaptive time stepping)
-        dt = float(compute_dt(state, dx, cfl=0.4))
+        dt = float(compute_dt(state, dx, mu1, mu2, rho1_val, rho2_val, cfl=0.4, dt_max=1e-4))
         dt = min(dt, t_end - t)   # don't overshoot t_end
+        
+        
 
-        # Advance one time step
+        # Advance one time stepr
         state = step_jit(state, dt)
         t     += dt
         step_n += 1
