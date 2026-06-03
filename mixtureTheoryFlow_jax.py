@@ -41,6 +41,11 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 
+import importlib
+import bb_to_model_inputs as _bb_mod
+importlib.reload(_bb_mod)
+from bb_to_model_inputs import bb_to_model_inputs
+
 # Force JAX to use 64-bit floats — critical for numerical stability in PDEs.
 # By default JAX uses 32-bit, which accumulates floating point error quickly
 # in time-marching solvers.
@@ -307,7 +312,7 @@ def advance_mass(state, dt, dx):
 # These are INTERMEDIATE velocities u* — not yet volume-conserving.
 # The pressure projection in Step 3 will correct them.
 
-def advance_momentum(state, dt, dx, drag_coeff, d_b, mu1, mu2, theta):
+def advance_momentum(state, dt, dx, drag_coeff, d_b, D, mu1, mu2, theta):
     """
     Advance momentum equations for both phases (intermediate step).
     Returns intermediate velocities u1_star, u2_star (interior, shape N-2).
@@ -386,8 +391,21 @@ def advance_momentum(state, dt, dx, drag_coeff, d_b, mu1, mu2, theta):
     #drag_coeff = 0.44
     #d_b        = 1e-3
 
-    M1 = drag_coeff * (3.0/4.0) * (phi2_int * phi1_int * rho1[1:-1] / d_b) \
-         * jnp.abs(delta_u) * delta_u
+    #jax.debug.print("drag_coeff: {dc}, d_b: {db}", dc=drag_coeff, db=d_b)
+    '''
+    ##### - adding a drift flux term to try to cause plugging - ######
+    # Drift velocity — buoyancy-driven relative motion
+    u_drift = (rho1_int - rho2_int) * g * d_b**2 / (18 * mu1)
+    # Add to the effective slip in the drag term
+    delta_u_effective = (u2_int - u1_int) - u_drift
+    M1 = drag_coeff * (3.0/4.0) * (phi2_int * phi1_int * rho1_int / d_b) \
+        * jnp.abs(delta_u_effective) * delta_u_effective
+    '''
+    #### drag for modeling gas and liquid annular flow #####
+    #M1, M2 = compute_drag(phi1_int, phi2_int, rho1_int, rho2_int, u1_int, u2_int, mu1, d_b, D)
+
+    ###### original drag term without drift flux ######
+    M1 = drag_coeff * (3.0/4.0) * (phi2_int * phi1_int * rho1[1:-1] / d_b) * jnp.abs(delta_u) * delta_u
     M2 = -M1
 
     # --- Wall friction (Darcy-Weisbach) ---
@@ -407,7 +425,7 @@ def advance_momentum(state, dt, dx, drag_coeff, d_b, mu1, mu2, theta):
     f_darcy = 0.02    # Darcy friction factor (dimensionless)
                       # 0.01-0.02 typical for turbulent pipe flow
                       # 64/Re for laminar flow (Re = rho*u*D/mu)
-    D       = 0.038     # pipe diameter [m]
+    #D       = 0.0381     # pipe diameter [m]
 
     # Momentum-weighted mixture velocity at interior cells
     rho1_int = rho1[1:-1]
@@ -470,6 +488,37 @@ def advance_momentum(state, dt, dx, drag_coeff, d_b, mu1, mu2, theta):
 
     #return u1_star, u2_star
     return mom1_new, mom2_new
+
+
+def compute_drag(phi1, phi2, rho1, rho2, u1, u2, mu1, d_b, D):
+    delta_u = u2 - u1
+    
+    # --- Bubbly flow drag (phi_G < 0.25) ---
+    Re_b = rho1 * jnp.abs(delta_u) * d_b / (mu1 + 1e-10)
+    C_D_bubble = 24/(Re_b + 1e-6) * (1 + 0.15 * Re_b**0.687)
+    M_bubbly = (3/4) * (C_D_bubble / d_b) * rho1 * phi2 * phi1 \
+               * jnp.abs(delta_u) * delta_u
+
+    # --- Annular flow drag (phi_G > 0.75) ---
+    f_i = 0.005                    # Wallis interfacial friction factor
+    a_i = 4 * phi2 / (D + 1e-10)  # interfacial area per unit volume
+    M_annular = 0.5 * f_i * a_i * rho2 \
+                * jnp.abs(delta_u) * delta_u
+
+    # --- Slug flow drag (0.25 < phi_G < 0.75) ---
+    C_D_slug = 0.44
+    M_slug = (3/4) * (C_D_slug / D) * rho1 * phi2 * phi1 \
+             * jnp.abs(delta_u) * delta_u
+
+    # --- Smooth regime blending ---
+    # Use phi2 (gas fraction) as the regime indicator
+    w_bubbly  = jnp.clip((0.25 - phi2) / 0.25, 0.0, 1.0)
+    w_annular = jnp.clip((phi2 - 0.75) / 0.25, 0.0, 1.0)
+    w_slug    = 1.0 - w_bubbly - w_annular
+
+    M1 = w_bubbly * M_bubbly + w_slug * M_slug + w_annular * M_annular
+    M2 = -M1
+    return M1, M2
 
 
 # =============================================================================
@@ -765,7 +814,7 @@ def apply_boundary_conditions(state, phi1_int, phi2_int,
 # This is the function JAX will JIT-compile into a single XLA kernel.
 
 #def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet):
-def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet, d_b, mu1, mu2, theta, phi1_inlet=0.95):
+def time_step(state, dt, dx, drag_coeff, D, p_inlet, p_outlet, d_b, mu1, mu2, theta, phi1_inlet):
     """
     Advance the simulation state by one time step dt.
 
@@ -783,7 +832,7 @@ def time_step(state, dt, dx, drag_coeff, p_inlet, p_outlet, d_b, mu1, mu2, theta
     phi1_int, phi2_int = advance_mass(state, dt, dx)
 
     # Step 2: advance momentum (intermediate velocities)
-    mom1_new, mom2_new = advance_momentum(state, dt, dx, drag_coeff, d_b, mu1, mu2, theta)
+    mom1_new, mom2_new = advance_momentum(state, dt, dx, drag_coeff, d_b, D, mu1, mu2, theta)
     
     # calculate intermediate velocities from momentum, avoiding division by zero when phase is absent
     eps_phi = 1e-6
@@ -899,7 +948,8 @@ if __name__ == "__main__":
     t_end      = 6.0      # [s]
     #dt_max     = 1e-4
     '''
-        
+    
+    
     # --- Oil (EXXSOL D140) parameters ---
     L          = 1.0      # pipe length [m]
     D          = 0.038    # pipe diameter [m] — matches their 38mm test section
@@ -907,20 +957,55 @@ if __name__ == "__main__":
     theta      = 0.0     # pipe inclination angle from horizontal [radians], # 0 = horizontal, π/2 = vertical
     rho1_val   = 1000.0   # water [kg/m³]
     rho2_val   = 828.0   # oil [kg/m³]
-    phi1_0     = 0.90     # 70% water
-    p_inlet    = 1.01e5    # [Pa]
+    phi1_0     = 0.50     # 90% water
+    p_inlet    = 1.0001e5    # [Pa]
     p_outlet   = 1.0000e5    # [Pa]
     mu1        = 1e-3     # water [Pa·s]
     mu2        = 6e-3     # oil [Pa·s]
     #drag_coeff = 50000.0   # [kg/(m³·s)]
-    drag_coeff = 0.44     # [kg/(m³·s)] — use with the new drag model
+    drag_coeff = 0.001     # [kg/(m³·s)] — use with the new drag model
     d_b       = 1e-3     # effective particle diameter for drag [m]
-    t_end      = 6.0      # [s]
+    t_end      = 5.0      # [s]
     #dt_max     = 1e-4
     
+
+    '''
+    # modeling gas-liquid annular flow in a 1.5-inch pipe, with the drag model that includes bubbly, slug, and annular regimes
+    p = bb_to_model_inputs(
+    GL          = 33.95,    # lbm/(ft²·s)
+    GG          = 1.76,     # lbm/(ft²·s)
+    P_psia      = 88.88,
+    T_F         = 69.0,
+    theta_rad   = 0.0,
+    D_m         = 0.0381,   # 1.5-inch pipe
+    dpdz_psi_ft = 0.0041,   # directly from DP/DZ MEAS. column
+)
+    
+    # Unpack into the local names the rest of the code expects
+    L          = p['L']
+    N          = p['N']
+    D          = p['D_m']
+    theta      = p['theta']
+    rho1_val   = p['rho1_val']
+    rho2_val   = p['rho2_val']
+    mu1        = p['mu1']
+    mu2        = p['mu2']
+    p_inlet    = p['p_inlet']
+    p_outlet   = p['p_outlet']
+    drag_coeff = p['drag_coeff']
+    d_b        = p['d_b']
+    t_end      = p['t_end']
+    D          = p['D_m'] # pipe diameter [m]
+    N          = 100      # number of cells
+    '''
     # --- Grid ---
     dx, x = make_grid(L, N)
 
+    # Slug flow with oil-water properties
+    #phi1_0 = jnp.where(x < L/2, 0.3, 0.9)   # oil-rich left, water-rich right
+    #phi2_0 = 1.0 - phi1_0
+
+    #phi1_0 = p['phi1_0']   # uniform initial condition from f_L
 
     # --- Initial conditions ---
     state = initial_conditions(
@@ -936,13 +1021,40 @@ if __name__ == "__main__":
         p_inlet, p_outlet
     )
     '''    
-
+    '''
     print("=" * 60)
     print("1D Two-Phase Mixture Flow Solver")
     print("=" * 60)
     print(f"  Grid:       N={N} cells, dx={dx:.4f} m")
     print(f"  Phase 1:    ρ={rho1_val} kg/m³, φ₀={phi1_0}")
     print(f"  Phase 2:    ρ={rho2_val} kg/m³, φ₀={1-phi1_0:.2f}")
+    print(f"  ΔP drive:   {p_inlet - p_outlet:.0f} Pa")
+    print(f"  Drag coeff: {drag_coeff}")
+    print(f"  t_end:      {t_end} s")
+    
+    print()
+    '''
+
+    print("=" * 60)
+    print("1D Two-Phase Mixture Flow Solver")
+    print("=" * 60)
+    print(f"  Grid:       N={N} cells, dx={dx:.4f} m")
+    print(f"  Phase 1:    ρ={rho1_val} kg/m³")
+    print(f"  Phase 2:    ρ={rho2_val} kg/m³")
+
+    # Handle phi1_0 being either a scalar or an array
+    if hasattr(phi1_0, 'shape') and phi1_0.ndim > 0:
+        # It's an array — print summary statistics instead
+        print(f"  phi1_0:     min={float(phi1_0.min()):.3f}  "
+            f"max={float(phi1_0.max()):.3f}  "
+            f"(slug flow initial condition)")
+        print(f"  phi2_0:     min={float(phi2_0.min()):.3f}  "
+            f"max={float(phi2_0.max()):.3f}")
+    else:
+        # It's a scalar — format normally
+        print(f"  phi1_0:     {phi1_0:.3f}")
+        print(f"  phi2_0:     {1-phi1_0:.3f}")
+
     print(f"  ΔP drive:   {p_inlet - p_outlet:.0f} Pa")
     print(f"  Drag coeff: {drag_coeff}")
     print(f"  t_end:      {t_end} s")
@@ -956,12 +1068,21 @@ if __name__ == "__main__":
     #step_jit = jax.jit(
     #    lambda s, dt: time_step(s, dt, dx, drag_coeff, p_inlet, p_outlet)
     #)
-    
+    # defining phase composition of inlet BC when have plugging
+    phi1_inlet_bc = 0.5   # ≈ 0.05
+    # use the below for modeling air and water in annular flow
+    #phi1_inlet_bc = p['phi1_inlet']  
     step_jit = jax.jit(
-    lambda s, dt: time_step(s, dt, dx, drag_coeff, 
-                             p_inlet, p_outlet, d_b, mu1, mu2, theta, phi1_0)
+    lambda s, dt: time_step(s, dt, dx, drag_coeff, D,
+                             p_inlet, p_outlet, d_b, mu1, mu2, theta, phi1_inlet_bc)
     )
-
+    
+    # for when don't have plugging and just want to use the initial condition as inlet BC
+    #step_jit = jax.jit(
+    #lambda s, dt: time_step(s, dt, dx, drag_coeff, 
+    #                         p_inlet, p_outlet, d_b, mu1, mu2, theta, phi1_0)
+    #)
+    
     # --- Storage for output ---
     save_every  = 5000   # save state every N steps
     saved_times = []
