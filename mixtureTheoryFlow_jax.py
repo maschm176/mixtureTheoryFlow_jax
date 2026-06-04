@@ -950,23 +950,32 @@ if __name__ == "__main__":
     '''
     
     
-    # --- Oil (EXXSOL D140) parameters ---
-    L          = 1.0      # pipe length [m]
-    D          = 0.038    # pipe diameter [m] — matches their 38mm test section
-    N          = 100      # number of cells
+    # --- Oil (EXXSOL D140) parameters, from Ibarra Paper ---
+    L          = 6.7      # pipe length [m]
+    D          = 0.032    # pipe diameter [m] — matches their 32mm test section
+    N          = 500      # number of cells
     theta      = 0.0     # pipe inclination angle from horizontal [radians], # 0 = horizontal, π/2 = vertical
-    rho1_val   = 1000.0   # water [kg/m³]
-    rho2_val   = 828.0   # oil [kg/m³]
-    phi1_0     = 0.50     # 90% water
-    p_inlet    = 1.0001e5    # [Pa]
+    rho1_val   = 998.0   # water [kg/m³]
+    rho2_val   = 825.0   # oil [kg/m³]
+    
+    phi1_0     = 0.9   # 90% water
+    # defining phase composition of inlet BC when have plugging
+    phi1_inlet_bc = 0.9    # ≈ 0.05
+    
+    dpdz_pa     = 503.88  # taken/calculated from figure 10
+    #p_inlet    = 1.0001e5    # [Pa]
     p_outlet   = 1.0000e5    # [Pa]
-    mu1        = 1e-3     # water [Pa·s]
-    mu2        = 6e-3     # oil [Pa·s]
+    
+    mu1        = 5.4E-3    # water [Pa·s]
+    mu2        = 0.9E-3     # oil [Pa·s]
     #drag_coeff = 50000.0   # [kg/(m³·s)]
     drag_coeff = 0.001     # [kg/(m³·s)] — use with the new drag model
     d_b       = 1e-3     # effective particle diameter for drag [m]
     t_end      = 5.0      # [s]
     #dt_max     = 1e-4
+    
+    delta_p = dpdz_pa * L
+    p_inlet = p_outlet + delta_p
     
 
     '''
@@ -1068,8 +1077,7 @@ if __name__ == "__main__":
     #step_jit = jax.jit(
     #    lambda s, dt: time_step(s, dt, dx, drag_coeff, p_inlet, p_outlet)
     #)
-    # defining phase composition of inlet BC when have plugging
-    phi1_inlet_bc = 0.5   # ≈ 0.05
+
     # use the below for modeling air and water in annular flow
     #phi1_inlet_bc = p['phi1_inlet']  
     step_jit = jax.jit(
@@ -1195,6 +1203,30 @@ if __name__ == "__main__":
     plt.show()
     print("Plot saved to mixture_flow_result.png")
 
+############## for validating data with the Ibarra Paper ########
+##### input pressure gradient into model, water cut (vol fraction), 
+##### and extract u1, u2, to compare with experimental data from the paper.
+
+# After simulation reaches steady state, extract plateau region
+# Use middle 50% of pipe to avoid inlet/outlet boundary effects
+i_start = N // 4      # 25% along pipe
+i_end   = 3 * N // 4  # 75% along pipe
+
+phi1_plateau = jnp.mean(state['phi1'][i_start:i_end])
+phi2_plateau = jnp.mean(state['phi2'][i_start:i_end])
+u1_plateau   = jnp.mean(state['u1'][i_start:i_end])
+u2_plateau   = jnp.mean(state['u2'][i_start:i_end])
+
+# Mixture velocity — volume-fraction weighted average of phase velocities
+U_m_predicted = phi1_plateau * u1_plateau + phi2_plateau * u2_plateau
+
+print(f"phi1 plateau:    {phi1_plateau:.4f}  (input was {phi1_0})")
+print(f"phi2 plateau:    {phi2_plateau:.4f}")
+print(f"u1 (water):      {u1_plateau:.4f} m/s")
+print(f"u2 (oil):        {u2_plateau:.4f} m/s")
+print(f"U_m predicted:   {U_m_predicted:.4f} m/s")
+print(f"U_m target:      1.25000 m/s")
+print(f"Error:           {(U_m_predicted - 1.25)/1.25 * 100:.2f}%")
 
 # =============================================================================
 # APPENDIX: UPGRADING TO RK2 TIME INTEGRATION
