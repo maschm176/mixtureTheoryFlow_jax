@@ -1255,3 +1255,333 @@ print(f"Error:           {(U_m_predicted - 1.25)/1.25 * 100:.2f}%")
 # RK2 is second-order accurate (error ~ dt²) vs Euler's first-order (error ~ dt).
 # This means you can use larger dt for the same accuracy, or get much better
 # accuracy at the same dt. The cost is two RHS evaluations per step instead of one.
+
+
+"""
+validation_plot.py
+------------------
+Generates two validation plots comparing your two-fluid model predictions
+against Ibarra et al. (2015) experimental data.
+
+    Plot 1 — WC vs Mixture Velocity (one subplot per Um)
+             Shows predicted Um against the experimental target line
+             for each water cut tested.
+
+    Plot 2 — Parity plot (Um measured vs Um predicted)
+             All conditions on one plot, colored by mixture velocity,
+             with 1:1 line and ±10% error bands.
+
+CSV FORMAT EXPECTED
+-------------------
+One file per mixture velocity, e.g. ibarra_Um_0p50.csv
+Columns:
+    WC               — water cut (input volume fraction)
+    dpdz_measured    — pressure gradient Pa/m from Figure 10
+    Um_target        — target mixture velocity m/s (constant per file)
+    flow_regime      — flow regime string from Figure 6 (SW, SWD, DC, etc.)
+    phi1_predicted   — model steady-state water volume fraction
+    u1_predicted     — model steady-state water velocity m/s
+    u2_predicted     — model steady-state oil velocity m/s
+    Um_predicted     — model mixture velocity = phi1*u1 + phi2*u2
+
+USAGE
+-----
+1. Fill in phi1_predicted, u1_predicted, u2_predicted, Um_predicted
+   columns in each CSV after running your simulation for each row.
+2. Run:  python validation_plot.py
+3. Plots saved as:
+       validation_wc_vs_Um.png
+       validation_parity.png
+"""
+
+
+
+####################### for visualizing the validation data from the Ibarra paper #######################
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.lines import Line2D
+
+# ── User config ────────────────────────────────────────────────────────────────
+
+CSV_DIR   = "."           # folder containing your CSVs
+CSV_FILES = [                             # one per mixture velocity
+    "ibarra_Um_0p50.csv",
+    "ibarra_Um_0p75.csv",
+    "ibarra_Um_0p85.csv",
+    "ibarra_Um_1p25.csv",
+]
+OUT_DIR   = "./validation_plots"          # where plots are saved
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Colors per mixture velocity — distinct, print-safe palette
+UM_COLORS = {
+    0.50: "#2563EB",   # blue
+    0.75: "#16A34A",   # green
+    0.85: "#D97706",   # amber
+    1.25: "#DC2626",   # red
+}
+
+# Flow regime marker styles
+REGIME_MARKERS = {
+    "SS":    "o",
+    "SW":    "s",
+    "SWD":   "^",
+    "DC":    "D",
+    "DOW":   "v",
+    "DWO":   "p",
+    "other": "x",
+}
+
+# ── Load data ──────────────────────────────────────────────────────────────────
+
+def load_csvs(csv_dir, csv_files):
+    """
+    Load all CSV files and return a list of DataFrames.
+    Skips files where prediction columns are empty (not yet run).
+    """
+    dfs = []
+    for fname in csv_files:
+        fpath = os.path.join(csv_dir, fname)
+        if not os.path.exists(fpath):
+            print(f"  [skip] {fname} not found")
+            continue
+        df = pd.read_csv(fpath)
+        # Strip whitespace from column names and string values
+        df.columns = df.columns.str.strip()
+        if "flow_regime" in df.columns:
+            df["flow_regime"] = df["flow_regime"].astype(str).str.strip()
+        # Only keep rows where predictions have been filled in
+        has_predictions = df["Um_predicted"].notna()
+        if has_predictions.sum() == 0:
+            print(f"  [skip] {fname} — no predictions filled in yet")
+            continue
+        df = df[has_predictions].copy()
+        dfs.append(df)
+        print(f"  [load] {fname} — {len(df)} rows with predictions")
+    return dfs
+
+
+# ── Plot 1: WC vs Mixture Velocity ────────────────────────────────────────────
+
+def plot_wc_vs_um(dfs):
+    """
+    One subplot per mixture velocity showing:
+      - Horizontal dashed line:  experimental target Um
+      - Scatter points:          model predicted Um at each WC
+      - ±10% shaded band:        experimental uncertainty
+    x-axis: Water Cut
+    y-axis: Mixture Velocity (m/s)
+    """
+    n = len(dfs)
+    if n == 0:
+        print("No data to plot for Plot 1.")
+        return
+
+    fig, axes = plt.subplots(
+        1, n,
+        figsize=(4.5 * n, 5),
+        sharey=False,
+    )
+    if n == 1:
+        axes = [axes]
+
+    fig.suptitle(
+        "Validation — Mixture Velocity vs Water Cut\n"
+        "Ibarra et al. (2015), 32 mm horizontal pipe, Exxsol D140 / water",
+        fontsize=11, fontweight="bold", y=1.02,
+    )
+
+    for ax, df in zip(axes, dfs):
+        Um_target = float(df["Um_target"].iloc[0])
+        color     = UM_COLORS.get(Um_target, "#555555")
+
+        # ±10% band around target
+        ax.axhspan(
+            Um_target * 0.90, Um_target * 1.10,
+            color=color, alpha=0.08, label="±10% band",
+        )
+        # Target line
+        ax.axhline(
+            Um_target, color=color, linestyle="--",
+            linewidth=1.8, label=f"Target {Um_target} m/s",
+        )
+
+        # Model predictions — marker per flow regime
+        for _, row in df.iterrows():
+            regime = str(row.get("flow_regime", "other")).strip()
+            marker = REGIME_MARKERS.get(regime, REGIME_MARKERS["other"])
+            ax.scatter(
+                row["WC"], row["Um_predicted"],
+                color=color, marker=marker,
+                s=70, zorder=5,
+                edgecolors="white", linewidths=0.5,
+            )
+
+        # Formatting
+        ax.set_xlabel("Water Cut", fontsize=10)
+        ax.set_ylabel("Mixture Velocity (m/s)", fontsize=10)
+        ax.set_title(f"$U_m$ = {Um_target} m/s", fontsize=10)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, Um_target * 2.0)
+        ax.grid(True, linestyle=":", alpha=0.5)
+
+        # Legend — target line + regime markers used in this subplot
+        regimes_present = df["flow_regime"].unique() if "flow_regime" in df.columns else []
+        legend_handles = [
+            Line2D([0], [0], color=color, linestyle="--",
+                   linewidth=1.8, label=f"Target {Um_target} m/s"),
+        ]
+        for r in regimes_present:
+            m = REGIME_MARKERS.get(r, REGIME_MARKERS["other"])
+            legend_handles.append(
+                Line2D([0], [0], marker=m, color="w",
+                       markerfacecolor=color, markersize=7,
+                       label=r, linestyle="None")
+            )
+        ax.legend(handles=legend_handles, fontsize=8, loc="upper right")
+
+    plt.tight_layout()
+    out_path = os.path.join(OUT_DIR, "validation_wc_vs_Um.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"\nPlot 1 saved → {out_path}")
+    plt.close()
+
+
+# ── Plot 2: Parity plot ────────────────────────────────────────────────────────
+
+def plot_parity(dfs):
+    """
+    All conditions on one parity plot:
+      - 1:1 line (perfect prediction)
+      - ±10% dashed error bands
+      - Points colored by Um, shaped by flow regime
+    x-axis: Um measured (experimental target)
+    y-axis: Um predicted (your model)
+    """
+    if not dfs:
+        print("No data to plot for Plot 2.")
+        return
+
+    # Combine all dataframes
+    all_data = pd.concat(dfs, ignore_index=True)
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    # Determine axis limits from data range
+    all_vals  = pd.concat([all_data["Um_target"], all_data["Um_predicted"]])
+    val_min   = max(0, all_vals.min() * 0.85)
+    val_max   = all_vals.max() * 1.15
+    lim       = (val_min, val_max)
+
+    # 1:1 line
+    ax.plot(lim, lim, color="#111111", linewidth=1.5,
+            linestyle="-", label="1:1 (perfect)", zorder=2)
+
+    # ±10% bands
+    x_band = np.linspace(val_min, val_max, 200)
+    ax.fill_between(
+        x_band, x_band * 0.90, x_band * 1.10,
+        color="#AAAAAA", alpha=0.15, label="±10% band",
+    )
+    ax.plot(x_band, x_band * 0.90, color="#888888",
+            linestyle="--", linewidth=0.8)
+    ax.plot(x_band, x_band * 1.10, color="#888888",
+            linestyle="--", linewidth=0.8)
+
+    # Data points
+    for _, row in all_data.iterrows():
+        Um_t   = float(row["Um_target"])
+        Um_p   = float(row["Um_predicted"])
+        regime = str(row.get("flow_regime", "other")).strip()
+        color  = UM_COLORS.get(Um_t, "#555555")
+        marker = REGIME_MARKERS.get(regime, REGIME_MARKERS["other"])
+        ax.scatter(
+            Um_t, Um_p,
+            color=color, marker=marker,
+            s=80, zorder=5,
+            edgecolors="white", linewidths=0.6,
+        )
+
+    # Compute summary statistics
+    errors = (all_data["Um_predicted"] - all_data["Um_target"]) \
+             / all_data["Um_target"] * 100
+    mae  = errors.abs().mean()
+    bias = errors.mean()
+    std  = errors.std()
+
+    stats_text = (
+        f"n = {len(all_data)}\n"
+        f"Mean error:  {bias:+.1f}%\n"
+        f"Mean |error|: {mae:.1f}%\n"
+        f"Std dev:     {std:.1f}%"
+    )
+    ax.text(
+        0.04, 0.96, stats_text,
+        transform=ax.transAxes,
+        fontsize=9, verticalalignment="top",
+        bbox=dict(boxstyle="round,pad=0.4",
+                  facecolor="white", edgecolor="#CCCCCC", alpha=0.9),
+    )
+
+    # Legend — Um colors
+    um_handles = [
+        mpatches.Patch(color=c, label=f"$U_m$ = {u} m/s")
+        for u, c in UM_COLORS.items()
+        if u in all_data["Um_target"].values
+    ]
+    # Regime markers
+    regimes_present = all_data["flow_regime"].unique() \
+        if "flow_regime" in all_data.columns else []
+    regime_handles = [
+        Line2D([0], [0], marker=REGIME_MARKERS.get(r, "x"),
+               color="w", markerfacecolor="#555555",
+               markersize=7, label=r, linestyle="None")
+        for r in regimes_present
+    ]
+    ax.legend(
+        handles=um_handles + regime_handles,
+        fontsize=8, loc="lower right",
+        title="Color = $U_m$  |  Shape = regime",
+        title_fontsize=8,
+    )
+
+    ax.set_xlabel("$U_m$ measured (m/s)", fontsize=11)
+    ax.set_ylabel("$U_m$ predicted (m/s)", fontsize=11)
+    ax.set_title(
+        "Parity Plot — Mixture Velocity\n"
+        "Ibarra et al. (2015) vs Two-Fluid Model",
+        fontsize=11, fontweight="bold",
+    )
+    ax.set_xlim(lim)
+    ax.set_ylim(lim)
+    ax.set_aspect("equal")
+    ax.grid(True, linestyle=":", alpha=0.4)
+
+    plt.tight_layout()
+    out_path = os.path.join(OUT_DIR, "validation_parity.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Plot 2 saved → {out_path}")
+    plt.close()
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("Loading validation CSVs...")
+    dfs = load_csvs(CSV_DIR, CSV_FILES)
+
+    if not dfs:
+        print(
+            "\nNo filled-in prediction data found.\n"
+            "Fill in phi1_predicted, u1_predicted, u2_predicted, Um_predicted\n"
+            "columns in your CSVs, then re-run this script."
+        )
+    else:
+        print(f"\nGenerating plots from {sum(len(d) for d in dfs)} data points...")
+        plot_wc_vs_um(dfs)
+        plot_parity(dfs)
+        print("\nDone.")
