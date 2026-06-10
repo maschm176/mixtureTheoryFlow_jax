@@ -408,20 +408,10 @@ def advance_momentum(state, dt, dx, drag_coeff, d_b, D, mu1, mu2, theta):
     M1 = drag_coeff * (3.0/4.0) * (phi2_int * phi1_int * rho1[1:-1] / d_b) * jnp.abs(delta_u) * delta_u
     M2 = -M1
 
+    #'''
     # --- Wall friction (Darcy-Weisbach) ---
-    # Resists bulk mixture motion against the pipe wall.
-    # This is what allows the flow to reach steady state —
-    # without it, the pressure gradient accelerates the mixture forever.
-    #
     # F_wall = -(f / 2D) * rho_mix * u_mix * |u_mix|
-    #
-    # We compute the mixture velocity as the momentum-weighted average
-    # of the two phase velocities, then apply friction to each phase
-    # proportional to its volume fraction.
-    #
     # The negative sign is critical — friction always opposes flow direction.
-    # jnp.abs(u_mix) * u_mix gives u² with the correct sign.
-
     f_darcy = 0.02    # Darcy friction factor (dimensionless)
                       # 0.01-0.02 typical for turbulent pipe flow
                       # 64/Re for laminar flow (Re = rho*u*D/mu)
@@ -443,6 +433,71 @@ def advance_momentum(state, dt, dx, drag_coeff, d_b, D, mu1, mu2, theta):
     # pipe cross-section it occupies
     friction1 = phi1_int * F_friction
     friction2 = phi2_int * F_friction
+    #'''
+    
+    '''
+    # --- Wall friction (Darcy-Weisbach with Blasius friction factor) ---
+    # Friction factor is now computed per-phase from the local Reynolds number
+    # rather than using a single hardcoded constant.
+    #
+    # Blasius correlation (smooth pipe, turbulent):
+    #     f_D = 0.316 * Re^(-0.25)    valid for 4000 < Re < 100,000
+    #
+    # Laminar flow:
+    #     f_D = 64 / Re               exact analytical solution
+    #
+    # We switch between the two using jnp.where so JAX can trace through
+    # both branches without data-dependent Python control flow.
+    #
+    # Each phase gets its own Reynolds number using its own velocity,
+    # density, viscosity, and hydraulic diameter — consistent with
+    # how Ibarra's two-fluid model treats wall friction per phase.
+
+    eps = 1e-10
+
+    rho1_int = rho1[1:-1]
+    rho2_int = rho2[1:-1]
+
+    # Hydraulic diameter per phase — each phase only occupies a fraction
+    # of the pipe cross-section, so its effective diameter is scaled
+    # by its volume fraction. This is the standard two-fluid model
+    # approximation for stratified flow.
+    D_h1 = D * phi1_int           # water hydraulic diameter [m]
+    D_h2 = D * phi2_int           # oil hydraulic diameter [m]
+
+    # Reynolds number per phase
+    # Using absolute velocity to keep Re positive regardless of flow direction
+    Re1 = rho1_int * jnp.abs(u1_int) * D_h1 / (mu1 + eps)
+    Re2 = rho2_int * jnp.abs(u2_int) * D_h2 / (mu2 + eps)
+
+    # Blasius friction factor per phase
+    # jnp.where traces both branches — guards against Re=0 division
+    f_D1 = jnp.where(
+        Re1 > 2100,
+        0.316 * Re1**(-0.25),      # turbulent — Blasius
+        64.0 / (Re1 + eps)         # laminar — exact solution
+    )
+
+    f_D2 = jnp.where(
+        Re2 > 2100,
+        0.316 * Re2**(-0.25),      # turbulent — Blasius
+        64.0 / (Re2 + eps)         # laminar — exact solution
+    )
+
+    # Friction force per unit volume on each phase individually
+    # Each phase feels friction from its own wall contact only —
+    # not a mixture average. The negative sign ensures friction
+    # always opposes the direction of flow.
+    #
+    # F = -(f_D / (2*D_h)) * rho * u * |u|
+    #
+    # u * |u| gives u² with the correct sign for direction.
+    friction1 = -(f_D1 / (2.0 * D_h1 + eps)) \
+                * rho1_int * u1_int * jnp.abs(u1_int) * phi1_int
+
+    friction2 = -(f_D2 / (2.0 * D_h2 + eps)) \
+                * rho2_int * u2_int * jnp.abs(u2_int) * phi2_int
+    '''
 
     # --- Advance conserved momentum ---
     # All source terms combined: drag + wall friction
@@ -958,11 +1013,11 @@ if __name__ == "__main__":
     rho1_val   = 998.0   # water [kg/m³]
     rho2_val   = 825.0   # oil [kg/m³]
     
-    phi1_0     = 0.9   # 90% water
+    phi1_0     = 0.3156   # 30% water
     # defining phase composition of inlet BC when have plugging
-    phi1_inlet_bc = 0.9    # ≈ 0.05
+    phi1_inlet_bc = 0.3156    # ≈ 0.05
     
-    dpdz_pa     = 503.88  # taken/calculated from figure 10
+    dpdz_pa     = 91.411 # taken/calculated from figure 10
     #p_inlet    = 1.0001e5    # [Pa]
     p_outlet   = 1.0000e5    # [Pa]
     
@@ -1138,6 +1193,7 @@ if __name__ == "__main__":
                     f"phi1 max={float(state['phi1'].max()):.6f} "
                     f"phi2 min={float(state['phi2'].min()):.6f} "
                     f"phi2 max={float(state['phi2'].max()):.6f}")
+                
 
         '''
         # Add this — print dp diagnostic for first 5 steps
@@ -1167,7 +1223,6 @@ if __name__ == "__main__":
         '''
         
         
-
 
     print(f"\nDone. {step_n} steps completed.")
     
@@ -1207,6 +1262,16 @@ if __name__ == "__main__":
 ##### input pressure gradient into model, water cut (vol fraction), 
 ##### and extract u1, u2, to compare with experimental data from the paper.
 
+# Check that mixture velocity is actually constant along pipe
+# (confirms your simulation has reached steady state)
+Um_profile = state['phi1'] * state['u1'] + state['phi2'] * state['u2']
+
+print(f"U_m at inlet:   {Um_profile[5]:.4f} m/s")
+print(f"U_m at midpipe: {Um_profile[N//2]:.4f} m/s")
+print(f"U_m at outlet:  {Um_profile[-5]:.4f} m/s")
+print(f"Variation:      {jnp.std(Um_profile):.4f} m/s")
+
+
 # After simulation reaches steady state, extract plateau region
 # Use middle 50% of pipe to avoid inlet/outlet boundary effects
 i_start = N // 4      # 25% along pipe
@@ -1225,8 +1290,8 @@ print(f"phi2 plateau:    {phi2_plateau:.4f}")
 print(f"u1 (water):      {u1_plateau:.4f} m/s")
 print(f"u2 (oil):        {u2_plateau:.4f} m/s")
 print(f"U_m predicted:   {U_m_predicted:.4f} m/s")
-print(f"U_m target:      1.25000 m/s")
-print(f"Error:           {(U_m_predicted - 1.25)/1.25 * 100:.2f}%")
+print(f"U_m target:      0.5000 m/s")
+print(f"Error:           {(U_m_predicted - 0.5)/0.5 * 100:.2f}%")
 
 # =============================================================================
 # APPENDIX: UPGRADING TO RK2 TIME INTEGRATION
@@ -1293,295 +1358,3 @@ USAGE
        validation_wc_vs_Um.png
        validation_parity.png
 """
-
-
-
-####################### for visualizing the validation data from the Ibarra paper #######################
-
-import os
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.lines import Line2D
-
-# ── User config ────────────────────────────────────────────────────────────────
-
-CSV_DIR   = "."           # folder containing your CSVs
-CSV_FILES = [                             # one per mixture velocity
-    "ibarra_Um_0p50.csv",
-    "ibarra_Um_0p75.csv",
-    "ibarra_Um_0p85.csv",
-    "ibarra_Um_1p25.csv",
-]
-OUT_DIR   = "./validation_plots"          # where plots are saved
-os.makedirs(OUT_DIR, exist_ok=True)
-
-# Colors per mixture velocity — distinct, print-safe palette
-UM_COLORS = {
-    0.50: "#2563EB",   # blue
-    0.75: "#16A34A",   # green
-    0.85: "#D97706",   # amber
-    1.25: "#DC2626",   # red
-}
-
-# Flow regime marker styles
-REGIME_MARKERS = {
-    "SS":    "o",
-    "SW":    "s",
-    "SWD":   "^",
-    "DC":    "D",
-    "DOW":   "v",
-    "DWO":   "p",
-    "other": "x",
-}
-
-# ── Load data ──────────────────────────────────────────────────────────────────
-
-def load_csvs(csv_dir, csv_files):
-    """
-    Load all CSV files and return a list of DataFrames.
-    Skips files where prediction columns are empty (not yet run).
-    """
-    dfs = []
-    for fname in csv_files:
-        fpath = os.path.join(csv_dir, fname)
-        if not os.path.exists(fpath):
-            print(f"  [skip] {fname} not found")
-            continue
-        df = pd.read_csv(fpath)
-        # Strip whitespace from column names and string values
-        df.columns = df.columns.str.strip()
-        if "flow_regime" in df.columns:
-            df["flow_regime"] = df["flow_regime"].astype(str).str.strip()
-        # Only keep rows where predictions have been filled in
-        has_predictions = df["Um_predicted"].notna()
-        if has_predictions.sum() == 0:
-            print(f"  [skip] {fname} — no predictions filled in yet")
-            continue
-        df = df[has_predictions].copy()
-        dfs.append(df)
-        print(f"  [load] {fname} — {len(df)} rows with predictions")
-    return dfs
-
-
-# ── Plot 1: WC vs Mixture Velocity ────────────────────────────────────────────
-
-def plot_wc_vs_um(dfs):
-    """
-    One subplot per mixture velocity showing:
-      - Horizontal dashed line:  experimental target Um
-      - Scatter points:          model predicted Um at each WC
-      - ±10% shaded band:        experimental uncertainty
-    x-axis: Water Cut
-    y-axis: Mixture Velocity (m/s)
-    """
-    n = len(dfs)
-    if n == 0:
-        print("No data to plot for Plot 1.")
-        return
-
-    fig, axes = plt.subplots(
-        1, n,
-        figsize=(4.5 * n, 5),
-        sharey=False,
-    )
-    if n == 1:
-        axes = [axes]
-
-    fig.suptitle(
-        "Validation — Mixture Velocity vs Water Cut\n"
-        "Ibarra et al. (2015), 32 mm horizontal pipe, Exxsol D140 / water",
-        fontsize=11, fontweight="bold", y=1.02,
-    )
-
-    for ax, df in zip(axes, dfs):
-        Um_target = float(df["Um_target"].iloc[0])
-        color     = UM_COLORS.get(Um_target, "#555555")
-
-        # ±10% band around target
-        ax.axhspan(
-            Um_target * 0.90, Um_target * 1.10,
-            color=color, alpha=0.08, label="±10% band",
-        )
-        # Target line
-        ax.axhline(
-            Um_target, color=color, linestyle="--",
-            linewidth=1.8, label=f"Target {Um_target} m/s",
-        )
-
-        # Model predictions — marker per flow regime
-        for _, row in df.iterrows():
-            regime = str(row.get("flow_regime", "other")).strip()
-            marker = REGIME_MARKERS.get(regime, REGIME_MARKERS["other"])
-            ax.scatter(
-                row["WC"], row["Um_predicted"],
-                color=color, marker=marker,
-                s=70, zorder=5,
-                edgecolors="white", linewidths=0.5,
-            )
-
-        # Formatting
-        ax.set_xlabel("Water Cut", fontsize=10)
-        ax.set_ylabel("Mixture Velocity (m/s)", fontsize=10)
-        ax.set_title(f"$U_m$ = {Um_target} m/s", fontsize=10)
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, Um_target * 2.0)
-        ax.grid(True, linestyle=":", alpha=0.5)
-
-        # Legend — target line + regime markers used in this subplot
-        regimes_present = df["flow_regime"].unique() if "flow_regime" in df.columns else []
-        legend_handles = [
-            Line2D([0], [0], color=color, linestyle="--",
-                   linewidth=1.8, label=f"Target {Um_target} m/s"),
-        ]
-        for r in regimes_present:
-            m = REGIME_MARKERS.get(r, REGIME_MARKERS["other"])
-            legend_handles.append(
-                Line2D([0], [0], marker=m, color="w",
-                       markerfacecolor=color, markersize=7,
-                       label=r, linestyle="None")
-            )
-        ax.legend(handles=legend_handles, fontsize=8, loc="upper right")
-
-    plt.tight_layout()
-    out_path = os.path.join(OUT_DIR, "validation_wc_vs_Um.png")
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    print(f"\nPlot 1 saved → {out_path}")
-    plt.close()
-
-
-# ── Plot 2: Parity plot ────────────────────────────────────────────────────────
-
-def plot_parity(dfs):
-    """
-    All conditions on one parity plot:
-      - 1:1 line (perfect prediction)
-      - ±10% dashed error bands
-      - Points colored by Um, shaped by flow regime
-    x-axis: Um measured (experimental target)
-    y-axis: Um predicted (your model)
-    """
-    if not dfs:
-        print("No data to plot for Plot 2.")
-        return
-
-    # Combine all dataframes
-    all_data = pd.concat(dfs, ignore_index=True)
-
-    fig, ax = plt.subplots(figsize=(6, 6))
-
-    # Determine axis limits from data range
-    all_vals  = pd.concat([all_data["Um_target"], all_data["Um_predicted"]])
-    val_min   = max(0, all_vals.min() * 0.85)
-    val_max   = all_vals.max() * 1.15
-    lim       = (val_min, val_max)
-
-    # 1:1 line
-    ax.plot(lim, lim, color="#111111", linewidth=1.5,
-            linestyle="-", label="1:1 (perfect)", zorder=2)
-
-    # ±10% bands
-    x_band = np.linspace(val_min, val_max, 200)
-    ax.fill_between(
-        x_band, x_band * 0.90, x_band * 1.10,
-        color="#AAAAAA", alpha=0.15, label="±10% band",
-    )
-    ax.plot(x_band, x_band * 0.90, color="#888888",
-            linestyle="--", linewidth=0.8)
-    ax.plot(x_band, x_band * 1.10, color="#888888",
-            linestyle="--", linewidth=0.8)
-
-    # Data points
-    for _, row in all_data.iterrows():
-        Um_t   = float(row["Um_target"])
-        Um_p   = float(row["Um_predicted"])
-        regime = str(row.get("flow_regime", "other")).strip()
-        color  = UM_COLORS.get(Um_t, "#555555")
-        marker = REGIME_MARKERS.get(regime, REGIME_MARKERS["other"])
-        ax.scatter(
-            Um_t, Um_p,
-            color=color, marker=marker,
-            s=80, zorder=5,
-            edgecolors="white", linewidths=0.6,
-        )
-
-    # Compute summary statistics
-    errors = (all_data["Um_predicted"] - all_data["Um_target"]) \
-             / all_data["Um_target"] * 100
-    mae  = errors.abs().mean()
-    bias = errors.mean()
-    std  = errors.std()
-
-    stats_text = (
-        f"n = {len(all_data)}\n"
-        f"Mean error:  {bias:+.1f}%\n"
-        f"Mean |error|: {mae:.1f}%\n"
-        f"Std dev:     {std:.1f}%"
-    )
-    ax.text(
-        0.04, 0.96, stats_text,
-        transform=ax.transAxes,
-        fontsize=9, verticalalignment="top",
-        bbox=dict(boxstyle="round,pad=0.4",
-                  facecolor="white", edgecolor="#CCCCCC", alpha=0.9),
-    )
-
-    # Legend — Um colors
-    um_handles = [
-        mpatches.Patch(color=c, label=f"$U_m$ = {u} m/s")
-        for u, c in UM_COLORS.items()
-        if u in all_data["Um_target"].values
-    ]
-    # Regime markers
-    regimes_present = all_data["flow_regime"].unique() \
-        if "flow_regime" in all_data.columns else []
-    regime_handles = [
-        Line2D([0], [0], marker=REGIME_MARKERS.get(r, "x"),
-               color="w", markerfacecolor="#555555",
-               markersize=7, label=r, linestyle="None")
-        for r in regimes_present
-    ]
-    ax.legend(
-        handles=um_handles + regime_handles,
-        fontsize=8, loc="lower right",
-        title="Color = $U_m$  |  Shape = regime",
-        title_fontsize=8,
-    )
-
-    ax.set_xlabel("$U_m$ measured (m/s)", fontsize=11)
-    ax.set_ylabel("$U_m$ predicted (m/s)", fontsize=11)
-    ax.set_title(
-        "Parity Plot — Mixture Velocity\n"
-        "Ibarra et al. (2015) vs Two-Fluid Model",
-        fontsize=11, fontweight="bold",
-    )
-    ax.set_xlim(lim)
-    ax.set_ylim(lim)
-    ax.set_aspect("equal")
-    ax.grid(True, linestyle=":", alpha=0.4)
-
-    plt.tight_layout()
-    out_path = os.path.join(OUT_DIR, "validation_parity.png")
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    print(f"Plot 2 saved → {out_path}")
-    plt.close()
-
-
-# ── Main ───────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    print("Loading validation CSVs...")
-    dfs = load_csvs(CSV_DIR, CSV_FILES)
-
-    if not dfs:
-        print(
-            "\nNo filled-in prediction data found.\n"
-            "Fill in phi1_predicted, u1_predicted, u2_predicted, Um_predicted\n"
-            "columns in your CSVs, then re-run this script."
-        )
-    else:
-        print(f"\nGenerating plots from {sum(len(d) for d in dfs)} data points...")
-        plot_wc_vs_um(dfs)
-        plot_parity(dfs)
-        print("\nDone.")
