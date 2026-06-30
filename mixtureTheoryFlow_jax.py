@@ -237,6 +237,7 @@ def advance_mass(state, dt, dx):
     """
     Advance mass equations for both phases by one time step.
     Returns updated phi1, phi2 (interior cells only, shape N-2).
+    
     """
     phi1 = state['phi1']
     phi2 = state['phi2']
@@ -244,47 +245,83 @@ def advance_mass(state, dt, dx):
     rho2 = state['rho2']
     u1   = state['u1']
     u2   = state['u2']
-    p = state['p']
+    p    = state['p']
 
-    # Conserved mass variables
+    eps_phi = 1e-6
+
+    # --- Conserved mass variables ---
     m1 = phi1 * rho1    # shape (N,)
     m2 = phi2 * rho2
 
-    # Physical mass fluxes at cell centers
+    # --- Physical mass fluxes at cell centers ---
     F_m1 = phi1 * rho1 * u1
-    F_m2 = phi2 * rho2 * u2
-    
-    eps_phi = 1e-06
-    # Zero out momentum for absent phases before computing fluxes
-    F_m2   = jnp.where(phi2 > eps_phi, phi2 * rho2 * u2, 0.0)
-    F_mom2 = jnp.where(phi2 > eps_phi, phi2 * rho2 * u2**2 + phi2 * p, 0.0)
+    F_m2 = jnp.where(phi2 > eps_phi, phi2 * rho2 * u2, 0.0)
 
-    # Max wave speed for Lax-Friedrichs dissipation
+    # --- Max wave speed for Lax-Friedrichs dissipation ---
     alpha = jnp.maximum(jnp.max(jnp.abs(u1)), jnp.max(jnp.abs(u2)))
     alpha = jnp.maximum(alpha, 1e-6)
 
-    # Numerical fluxes at faces, shape (N-1,)
+    # --- Numerical fluxes at faces, shape (N-1,) ---
     f_m1 = lax_friedrichs_flux(F_m1, m1, alpha)
     f_m2 = lax_friedrichs_flux(F_m2, m2, alpha)
-    
 
-    # Flux divergence at interior cells, shape (N-2,)
-    # (f[1:] - f[:-1]) / dx = net flux out of each interior cell
+    # --- Flux divergence at interior cells, shape (N-2,) ---
     div_m1 = (f_m1[1:] - f_m1[:-1]) / dx
     div_m2 = (f_m2[1:] - f_m2[:-1]) / dx
 
-    # Forward Euler advance of conserved mass (interior cells only)
+    # --- Forward Euler advance of conserved mass ---
     m1_new = m1[1:-1] - dt * div_m1   # shape (N-2,)
     m2_new = m2[1:-1] - dt * div_m2
 
-    # Recover volume fractions from updated mass
+    # --- Recover volume fractions from updated mass ---
     phi1_new = m1_new / rho1[1:-1]
     phi2_new = m2_new / rho2[1:-1]
 
-    # Clip to [0,1] — small overshoots from numerics can push fractions
-    # slightly negative; clipping prevents unphysical states
+    # ── Drift flux correction ──────────────────────────────────────────────────
+    # The drift flux of phase 1 relative to the mixture is:
+    #     j_drift = phi1 * phi2 * (u1 - u2)
+    #
+    # Its divergence acts as a redistribution source in the phi1 equation:
+    #     d(phi1)/dt += -d(j_drift)/dx
+    #
+    # Sign check:
+    #   oil faster than water → u2 > u1 → (u1 - u2) < 0
+    #   → j_drift < 0
+    #   → -d(j_drift)/dx > 0 in the interior (flux converging)
+    #   → phi1 increases → holdup rises above water cut ✓
+    #
+    # Note: j_drift is purely a volumetric redistribution — no rho needed
+    # because it acts on volume fractions directly, not mass.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # Drift flux at all cell centers, shape (N,)
+    j_drift_centers = phi1 * phi2 * (u1 - u2)
+
+    # Drift flux at faces via simple averaging, shape (N-1,)
+    # Simple averaging is consistent with the Lax-Friedrichs approach
+    # used for the main mass fluxes above
+    j_drift_faces = 0.5 * (j_drift_centers[:-1] + j_drift_centers[1:])
+
+    # Divergence of drift flux at interior cells, shape (N-2,)
+    div_drift = (j_drift_faces[1:] - j_drift_faces[:-1]) / dx
+
+    # Apply drift flux correction to volume fractions directly
+    # This is separate from the mass conservation step above because
+    # drift flux acts on volume fractions, not conserved mass variables
+    phi1_new = phi1_new - dt * div_drift
+    phi2_new = 1.0 - phi1_new   # enforce phi1 + phi2 = 1 exactly
+
+    # ── Clip to physical bounds ────────────────────────────────────────────────
+    # Small overshoots from numerics can push fractions slightly outside
+    # [0,1]. Clip first, then re-enforce the sum constraint.
     phi1_new = jnp.clip(phi1_new, 0.0, 1.0)
     phi2_new = jnp.clip(phi2_new, 0.0, 1.0)
+
+    # Re-normalize to guarantee phi1 + phi2 = 1 after clipping
+    # Clipping both independently can break the sum constraint
+    total    = phi1_new + phi2_new + 1e-10
+    phi1_new = phi1_new / total
+    phi2_new = phi2_new / total
 
     return phi1_new, phi2_new
 
@@ -415,8 +452,7 @@ def advance_momentum(state, dt, dx, drag_coeff, d_b, D, mu1, mu2, theta):
     f_darcy = 0.02    # Darcy friction factor (dimensionless)
                       # 0.01-0.02 typical for turbulent pipe flow
                       # 64/Re for laminar flow (Re = rho*u*D/mu)
-    #D       = 0.0381     # pipe diameter [m]
-
+    #D       = 0.0381     # pipe diameter [m]r
     # Momentum-weighted mixture velocity at interior cells
     rho1_int = rho1[1:-1]
     rho2_int = rho2[1:-1]
@@ -434,7 +470,7 @@ def advance_momentum(state, dt, dx, drag_coeff, d_b, D, mu1, mu2, theta):
     friction1 = phi1_int * F_friction
     friction2 = phi2_int * F_friction
     #'''
-    
+
     '''
     # --- Wall friction (Darcy-Weisbach with Blasius friction factor) ---
     # Friction factor is now computed per-phase from the local Reynolds number
@@ -1024,9 +1060,11 @@ if __name__ == "__main__":
     mu1        = 5.4E-3    # water [Pa·s]
     mu2        = 0.9E-3     # oil [Pa·s]
     #drag_coeff = 50000.0   # [kg/(m³·s)]
-    drag_coeff = 0.001     # [kg/(m³·s)] — use with the new drag model
+    #drag_coeff = 0.001     # [kg/(m³·s)] — use with the new drag model
+    drag_coeff = 1E-04
     d_b       = 1e-3     # effective particle diameter for drag [m]
-    t_end      = 5.0      # [s]
+    t_end      = 150.00     # [s]
+    #t_end      = 200.00     # [s]
     #dt_max     = 1e-4
     
     delta_p = dpdz_pa * L
@@ -1147,7 +1185,7 @@ if __name__ == "__main__":
     #)
     
     # --- Storage for output ---
-    save_every  = 5000   # save state every N steps
+    save_every  = 5E4   # save state every N steps
     saved_times = []
     saved_phi1  = []
     saved_u1    = []
