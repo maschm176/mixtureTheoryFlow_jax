@@ -38,6 +38,11 @@ NUMERICAL METHODS:
 
 import jax
 import jax.numpy as jnp
+import equinox as eqx
+import optax
+import numpy as np
+import pickle
+import time
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -45,6 +50,8 @@ import importlib
 import bb_to_model_inputs as _bb_mod
 importlib.reload(_bb_mod)
 from bb_to_model_inputs import bb_to_model_inputs
+
+
 
 # Force JAX to use 64-bit floats — critical for numerical stability in PDEs.
 # By default JAX uses 32-bit, which accumulates floating point error quickly
@@ -304,12 +311,25 @@ def advance_mass(state, dt, dx):
 
     # Divergence of drift flux at interior cells, shape (N-2,)
     div_drift = (j_drift_faces[1:] - j_drift_faces[:-1]) / dx
+    
+    # --- CFL stability limiter for drift flux ---
+    # Drift flux introduces effective advection at speed phi2 * |u2 - u1|
+    # Fixed dt in scan means no adaptive safety net — clip manually
+    max_drift_speed = jnp.max(jnp.abs(phi2 * (u2 - u1)))
+    max_drift_speed = jnp.maximum(max_drift_speed, 1e-10)
+    dt_cfl_drift    = 0.5 * dx / max_drift_speed
+    cfl_scale       = jnp.minimum(1.0, dt_cfl_drift / (dt + 1e-10))
+
+    # Apply SCALED drift flux
+    # need when dt is too low and using jax.lax.scan instead of while loop for the time loop
+    phi1_new = phi1_new - dt * cfl_scale * div_drift
+    phi2_new = 1.0 - phi1_new
 
     # Apply drift flux correction to volume fractions directly
     # This is separate from the mass conservation step above because
     # drift flux acts on volume fractions, not conserved mass variables
-    phi1_new = phi1_new - dt * div_drift
-    phi2_new = 1.0 - phi1_new   # enforce phi1 + phi2 = 1 exactly
+    #phi1_new = phi1_new - dt * div_drift
+    #phi2_new = 1.0 - phi1_new   # enforce phi1 + phi2 = 1 exactly
 
     # ── Clip to physical bounds ────────────────────────────────────────────────
     # Small overshoots from numerics can push fractions slightly outside
@@ -1009,6 +1029,176 @@ def compute_diagnostics(state, dx):
 
 
 # =============================================================================
+# SECTION 12: Neural Network Definition for Drag Closure
+# =============================================================================
+
+# ── Network architecture ───────────────────────────────────────────────────────
+class DragClosureNetwork(eqx.Module):
+    """
+    Phase 1: learns effective drag coefficient C_D_eff
+    from 4 scaled dimensional flow inputs.
+
+    Input:  [phi1, u1/1.5, u2/1.5, delta_u/0.1]  shape (4,)
+    Output: C_D_eff > 0                            scalar
+    """
+    layer1: eqx.nn.Linear
+    layer2: eqx.nn.Linear
+    layer3: eqx.nn.Linear
+    layer4: eqx.nn.Linear
+
+    def __init__(self, key):
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        self.layer1 = eqx.nn.Linear(4,  32, key=k1)
+        self.layer2 = eqx.nn.Linear(32, 32, key=k2)
+        self.layer3 = eqx.nn.Linear(32, 16, key=k3)
+        self.layer4 = eqx.nn.Linear(16,  1, key=k4)
+
+    def __call__(self, x):
+        x = jax.nn.tanh(self.layer1(x))
+        x = jax.nn.tanh(self.layer2(x))
+        x = jax.nn.tanh(self.layer3(x))
+        x = self.layer4(x)
+        return jax.nn.softplus(x[0])
+
+
+# ── Input feature builder ──────────────────────────────────────────────────────
+def build_network_inputs(phi1, u1, u2):
+    """
+    Build 4-dimensional scaled input vector.
+
+    Scaling brings all inputs to O(1):
+        phi1:    already O(1)
+        u1, u2:  O(0.3-1.5) m/s  → divide by 1.5
+        delta_u: O(0.01-0.1) m/s → divide by 0.1
+    """
+    delta_u = u2 - u1
+    return jnp.array([
+        phi1,
+        u1      / 1.5,
+        u2      / 1.5,
+        delta_u / 0.1,
+    ])
+
+
+# ── time_step wrapper that takes drag_c as explicit argument ───────────────────
+# Your existing time_step captures drag_coeff from outer scope.
+# This wrapper makes drag_c an explicit argument so jax.grad can
+# differentiate through it into the network weights.
+def time_step_learned(state, dt, dx, drag_c, D,
+                       p_inlet, p_outlet, d_b, mu1, mu2,
+                       theta, phi1_inlet):
+    """
+    Identical physics to your existing time_step.
+    Only difference: drag_c is an explicit argument, not captured
+    from outer scope — this is what makes it differentiable.
+    """
+    rho1_int = state['rho1'][1:-1]
+    rho2_int = state['rho2'][1:-1]
+
+    phi1_int, phi2_int = advance_mass(state, dt, dx)
+
+    mom1_new, mom2_new = advance_momentum(
+        state, dt, dx, drag_c, d_b, D, mu1, mu2, theta
+    )
+
+    eps_phi = 1e-6
+    eps     = 1e-10
+
+    u1_star = jnp.where(
+        phi1_int > eps_phi,
+        mom1_new / (phi1_int * rho1_int + eps),
+        0.0
+    )
+    u2_star = jnp.where(
+        phi2_int > eps_phi,
+        mom2_new / (phi2_int * rho2_int + eps),
+        0.0
+    )
+
+    dp = pressure_poisson_solve(
+        phi1_int, phi2_int,
+        rho1_int, rho2_int,
+        u1_star, u2_star,
+        dx, dt
+    )
+
+    u1_int, u2_int = project_velocities(
+        u1_star, u2_star, dp,
+        phi1_int, phi2_int,
+        rho1_int, rho2_int,
+        dx, dt
+    )
+
+    new_state = apply_boundary_conditions(
+        state, phi1_int, phi2_int,
+        u1_int, u2_int,
+        p_inlet, p_outlet,
+        phi1_inlet=phi1_inlet
+    )
+
+    return new_state
+
+
+# ── Loss function ──────────────────────────────────────────────────────────────
+def loss_fn(network, condition, n_window, dt_fixed,
+             dx, D, d_b, mu1, mu2, theta, N):
+    """
+    Runs a short differentiable simulation window using the network's
+    predicted C_D_eff, then compares outputs against synthetic targets.
+
+    Returns total loss and auxiliary info (phi1_pred, Um_pred, C_D_eff).
+    """
+    spinup_state = condition['spinup_state']
+
+    # Get C_D_eff from network
+    x = build_network_inputs(
+        jnp.array(condition['WC']),
+        jnp.array(condition['u1_mean']),
+        jnp.array(condition['u2_mean']),
+    )
+    C_D_eff = network(x)
+
+    # Scan step using learned C_D_eff
+    def learned_step(state, dt):
+        new_state = time_step_learned(
+            state, dt, dx, C_D_eff, D,
+            jnp.array(condition['p_inlet']),
+            jnp.array(condition['p_outlet']),
+            d_b, mu1, mu2, theta,
+            jnp.array(condition['phi1_inlet'])
+        )
+        return new_state, None
+
+    # Run differentiable window
+    final, _ = jax.lax.scan(
+        learned_step,
+        spinup_state,
+        jnp.full(n_window, dt_fixed),
+    )
+
+    # Extract outputs from plateau region
+    i_start = N // 4
+    i_end   = 3 * N // 4
+
+    phi1_p = final['phi1'][i_start:i_end]
+    phi2_p = final['phi2'][i_start:i_end]
+    u1_p   = final['u1'][i_start:i_end]
+    u2_p   = final['u2'][i_start:i_end]
+
+    phi1_pred = jnp.mean(phi1_p)
+    Um_pred   = jnp.mean(phi1_p * u1_p + phi2_p * u2_p)
+
+    # Normalized squared errors
+    phi1_target = jnp.array(condition['phi1_target'])
+    Um_target   = jnp.array(condition['Um_sim'])
+
+    loss_phi1 = ((phi1_pred - phi1_target) / (phi1_target + 1e-10))**2
+    loss_Um   = ((Um_pred   - Um_target)   / (Um_target   + 1e-10))**2
+
+    return loss_phi1 + loss_Um, (phi1_pred, Um_pred, C_D_eff)
+
+
+# =============================================================================
 # SECTION 12: MAIN — RUN THE SIMULATION
 # =============================================================================
 
@@ -1057,8 +1247,8 @@ if __name__ == "__main__":
     #p_inlet    = 1.0001e5    # [Pa]
     p_outlet   = 1.0000e5    # [Pa]
     
-    mu1        = 5.4E-3    # water [Pa·s]
-    mu2        = 0.9E-3     # oil [Pa·s]
+    mu1        = 5.4E-3    # oil [Pa·s]
+    mu2        = 0.9E-3     # water [Pa·s]
     #drag_coeff = 50000.0   # [kg/(m³·s)]
     #drag_coeff = 0.001     # [kg/(m³·s)] — use with the new drag model
     drag_coeff = 1E-04
@@ -1172,31 +1362,497 @@ if __name__ == "__main__":
     #)
 
     # use the below for modeling air and water in annular flow
-    #phi1_inlet_bc = p['phi1_inlet']  
+    # Your existing lambda — keep this for reference but won't use in scan
     step_jit = jax.jit(
-    lambda s, dt: time_step(s, dt, dx, drag_coeff, D,
-                             p_inlet, p_outlet, d_b, mu1, mu2, theta, phi1_inlet_bc)
+        lambda s, dt: time_step(s, dt, dx, drag_coeff, D,
+                                p_inlet, p_outlet, d_b, mu1, mu2, theta, phi1_inlet_bc)
     )
+
+    # New scan step — same closure pattern, scan-compatible signature
+    def scan_step(state, dt):
+        """
+        Wraps time_step for jax.lax.scan.
+        All args except state and dt captured from outer scope via closure.
+        Returns (new_state, new_state) — carry and stacked output.
+        """
+        new_state = time_step(
+            state, dt, dx, drag_coeff, D,
+            p_inlet, p_outlet, d_b, mu1, mu2,
+            theta, phi1_inlet_bc
+        )
+        return new_state, new_state
+
+    # JIT compile the scan step once
+    scan_step_jit = jax.jit(scan_step)
     
-    # for when don't have plugging and just want to use the initial condition as inlet BC
-    #step_jit = jax.jit(
-    #lambda s, dt: time_step(s, dt, dx, drag_coeff, 
-    #                         p_inlet, p_outlet, d_b, mu1, mu2, theta, phi1_0)
-    #)
+    def scan_step(state, dt):
+        new_state = time_step(
+            state, dt, dx, drag_coeff, D,
+            p_inlet, p_outlet, d_b, mu1, mu2,
+            theta, phi1_inlet_bc
+        )
+        return new_state, None   # None saves memory vs returning full state
     
     # --- Storage for output ---
-    save_every  = 5E4   # save state every N steps
+    # use when use while loop with save_every
+    #save_every  = 5E4   # save state every N steps
     saved_times = []
     saved_phi1  = []
     saved_u1    = []
     saved_u2    = []
     
     saved_phi2 = []
+    
 
     # --- Time loop ---
     t      = 0.0
     step_n = 0
 
+    # ── Parameters ─────────────────────────────────────────────────────────────────
+    dt_fixed = 1e-4      # [s] — your existing dt_max, safe fixed value
+
+    t_spinup =   150.0     # [s] — from your experiments, converges by ~140s
+    #t_spinup =   5.0     # [s] — from your experiments, converges by ~140s
+    t_window =   1.0     # [s] — short differentiable window
+    
+    # Replace your step counts with these:
+    #t_spinup = 1.0      # just 1 second instead of 150
+    #t_window = 0.1      # just 0.1 seconds
+
+
+    n_spinup = int(t_spinup / dt_fixed)   # 1,500,000
+    n_window = int(t_window / dt_fixed)   # 10,000
+
+    print(f"Spinup:  {n_spinup:,} steps  ({t_spinup:.0f}s)")
+    print(f"Window:  {n_window:,} steps  ({t_window:.0f}s)")
+
+    # use the below when use the differentiable window approach
+    save_every_window = 1000    # save state every this many steps
+    n_chunks          = n_window // save_every_window
+
+
+    # ── Phase 1: Spinup (no gradient tracking) ─────────────────────────────────────
+    print("\nRunning spinup...")
+    
+    # ── Define scan step (no jit here — scan handles it) ──────────────────────────
+    def scan_step(state, dt):
+        new_state = time_step(
+            state, dt, dx, drag_coeff, D,
+            p_inlet, p_outlet, d_b, mu1, mu2,
+            theta, phi1_inlet_bc
+        )
+        return new_state, None   # None saves memory
+
+    # ── Define jitted spinup function ─────────────────────────────────────────────
+    @jax.jit
+    def run_spinup_full(init_state):
+        final, _ = jax.lax.scan(
+            scan_step,
+            init_state,
+            jnp.full(n_spinup, dt_fixed),
+        )
+        return final
+
+    #### define once here then will use at almost every step to run chunks #######
+    @jax.jit
+    def run_chunk(init_state):
+        final, _ = jax.lax.scan(
+            scan_step,
+            init_state,
+            jnp.full(save_every_window, dt_fixed),
+        )
+        return final
+
+
+    # ── 3. Run spinup ──────────────────────────────────────────────────────────────
+    import time
+    t0 = time.time()
+
+    spinup_state = run_spinup_full(state)
+    spinup_state['phi1'].block_until_ready()
+
+    print(f"Spinup complete in {time.time()-t0:.1f}s")
+    print(f"  phi1: [{float(spinup_state['phi1'].min()):.6f}, "
+        f"{float(spinup_state['phi1'].max()):.6f}]")
+    print(f"  u1={float(jnp.max(jnp.abs(spinup_state['u1']))):.4f}  "
+        f"u2={float(jnp.max(jnp.abs(spinup_state['u2']))):.4f}")
+
+    spinup_state = jax.lax.stop_gradient(spinup_state)
+
+    
+    # ── Phase 2: Differentiable window ────────────────────────────────────────────
+    # Run in chunks so we can save snapshots for plotting
+    # Each chunk = save_every_window steps
+
+    saved_times = []
+    saved_phi1  = []
+    saved_phi2  = []
+    saved_u1    = []
+    saved_u2    = []
+
+    current_state = spinup_state
+    t_current     = t_spinup
+
+    print("\nRunning differentiable window...")
+
+    for chunk_idx in range(n_chunks):
+        t0 = time.time()
+        
+        # ← replace the old bare jax.lax.scan call with run_chunk
+        current_state = run_chunk(current_state)
+        current_state['phi1'].block_until_ready()
+
+        t_current += save_every_window * dt_fixed
+
+        saved_times.append(t_current)
+        saved_phi1.append(np.array(current_state['phi1']))
+        saved_phi2.append(np.array(current_state['phi2']))
+        saved_u1.append(np.array(current_state['u1']))
+        saved_u2.append(np.array(current_state['u2']))
+
+        print(f"  t={t_current:.3f}s  "
+            f"phi1=[{float(current_state['phi1'].min()):.4f}, "
+            f"{float(current_state['phi1'].max()):.4f}]  "
+            f"u1={float(jnp.max(jnp.abs(current_state['u1']))):.4f}  "
+            f"u2={float(jnp.max(jnp.abs(current_state['u2']))):.4f}")
+
+    final_state = current_state
+    
+    # ══════════════════════════════════════════════════════════════════════════════
+    # Section 7a — Synthetic dataset generation
+    # ══════════════════════════════════════════════════════════════════════════════
+
+    def generate_synthetic_dataset(drag_coeff_true, conditions,
+                                    n_spinup, dt_fixed,
+                                    dx, D, d_b, mu1, mu2,
+                                    theta, N,
+                                    rho1_val, rho2_val):
+        """
+        Run simulation at known drag_coeff_true for each condition.
+        Saves phi1_plateau, Um, u1_mean, u2_mean as training targets
+        and the converged spinup state for use during training.
+        """
+        dataset = []
+
+        for idx, cond in enumerate(conditions):
+            WC   = cond['WC']
+            dpdz = cond['dpdz']
+            Um_t = cond['Um_target']
+
+            p_out = 1.0000e5
+            p_in  = p_out + dpdz * L
+
+            print(f"\n  [{idx+1}/{len(conditions)}] "
+                f"WC={WC:.1f}  dpdz={dpdz:.1f} Pa/m  "
+                f"Um_target={Um_t:.2f} m/s")
+
+            # Initial state for this condition
+            dx_c, x_c = make_grid(L, N)
+            state_c = initial_conditions(
+                x_c, L, WC,
+                rho1_val, rho2_val,
+                p_in, p_out
+            )
+
+            # Scan step with known true drag
+            def make_scan_step(p_in_c, p_out_c, WC_c):
+                def scan_step_c(state, dt):
+                    new_state = time_step_learned(
+                        state, dt, dx_c, drag_coeff_true, D,
+                        p_in_c, p_out_c, d_b, mu1, mu2,
+                        theta, WC_c
+                    )
+                    return new_state, None
+                return scan_step_c
+
+            scan_fn = make_scan_step(p_in, p_out, WC)
+
+            run_spinup_c = jax.jit(lambda s: jax.lax.scan(
+                scan_fn, s, jnp.full(n_spinup, dt_fixed)
+            )[0])
+
+            t0 = time.time()
+            spinup = run_spinup_c(state_c)
+            spinup['phi1'].block_until_ready()
+            spinup = jax.lax.stop_gradient(spinup)
+            print(f"    Spinup done in {time.time()-t0:.1f}s")
+
+            # Extract plateau quantities
+            i_start = N // 4
+            i_end   = 3 * N // 4
+
+            phi1_p = spinup['phi1'][i_start:i_end]
+            phi2_p = spinup['phi2'][i_start:i_end]
+            u1_p   = spinup['u1'][i_start:i_end]
+            u2_p   = spinup['u2'][i_start:i_end]
+
+            phi1_plateau = float(jnp.mean(phi1_p))
+            u1_mean      = float(jnp.mean(u1_p))
+            u2_mean      = float(jnp.mean(u2_p))
+            Um_sim       = float(jnp.mean(phi1_p * u1_p + phi2_p * u2_p))
+
+            print(f"    phi1={phi1_plateau:.4f}  "
+                f"u1={u1_mean:.4f} m/s  "
+                f"u2={u2_mean:.4f} m/s  "
+                f"Um={Um_sim:.4f} m/s")
+
+            dataset.append({
+                'WC':           WC,
+                'dpdz':         dpdz,
+                'Um_target':    Um_t,
+                'p_inlet':      p_in,
+                'p_outlet':     p_out,
+                'phi1_inlet':   WC,
+                'phi1_target':  phi1_plateau,
+                'Um_sim':       Um_sim,
+                'u1_mean':      u1_mean,
+                'u2_mean':      u2_mean,
+                'spinup_state': spinup,
+            })
+
+        print(f"\nDataset complete: {len(dataset)} conditions generated.")
+        return dataset
+
+
+    # ── Training conditions ────────────────────────────────────────────────────────
+    # 8 conditions: 4 WC values × 2 mixture velocities
+    # Pressure gradients from Ibarra Figure 10
+
+    conditions = [
+        {'WC': 0.2, 'dpdz': 100.0, 'Um_target': 0.50},
+        {'WC': 0.3, 'dpdz': 105.0, 'Um_target': 0.50},
+        {'WC': 0.7, 'dpdz': 106.0, 'Um_target': 0.50},
+        {'WC': 0.8, 'dpdz': 105.0, 'Um_target': 0.50},
+        {'WC': 0.2, 'dpdz': 220.0, 'Um_target': 0.75},
+        {'WC': 0.3, 'dpdz': 228.0, 'Um_target': 0.75},
+        {'WC': 0.7, 'dpdz': 228.0, 'Um_target': 0.75},
+        {'WC': 0.8, 'dpdz': 225.0, 'Um_target': 0.75},
+    ]
+
+    # Generate dataset
+    print("=" * 60)
+    print("Generating synthetic training dataset")
+    print(f"  Known drag_coeff = {drag_coeff:.2e}  (network must recover this)")
+    print("=" * 60)
+
+    dataset = generate_synthetic_dataset(
+        drag_coeff_true = drag_coeff,
+        conditions      = conditions,
+        n_spinup        = n_spinup,
+        dt_fixed        = dt_fixed,
+        dx              = dx,
+        D               = D,
+        d_b             = d_b,
+        mu1             = mu1,
+        mu2             = mu2,
+        theta           = theta,
+        N               = N,
+        rho1_val        = rho1_val,
+        rho2_val        = rho2_val,
+    )
+
+    # Save dataset metadata (without spinup states — too large)
+    import pickle
+    with open('synthetic_dataset_phase1.pkl', 'wb') as f:
+        pickle.dump([
+            {k: v for k, v in cond.items() if k != 'spinup_state'}
+            for cond in dataset
+        ], f)
+    print("Dataset metadata saved to synthetic_dataset_phase1.pkl")
+    
+    
+# ══════════════════════════════════════════════════════════════════════════════
+# Section 7b — Training loop
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Hyperparameters ────────────────────────────────────────────────────────────
+n_window    = 1000    # differentiable window steps (0.1s at dt=1e-4)
+n_epochs    = 300
+lr          = 1e-3
+print_every = 25
+
+# ── Initialize network and optimizer ──────────────────────────────────────────
+key       = jax.random.PRNGKey(42)
+network   = DragClosureNetwork(key)
+optimizer = optax.adam(learning_rate=lr)
+opt_state = optimizer.init(eqx.filter(network, eqx.is_array))
+
+print(f"\n{'='*60}")
+print(f"Phase 1 Training — recover drag_coeff = {drag_coeff:.2e}")
+print(f"  Conditions:  {len(dataset)}")
+print(f"  Epochs:      {n_epochs}")
+print(f"  Window:      {n_window} steps ({n_window*dt_fixed:.2f}s)")
+print(f"  LR:          {lr}")
+print(f"{'='*60}\n")
+
+# ── Training ───────────────────────────────────────────────────────────────────
+for epoch in range(n_epochs):
+    epoch_loss     = 0.0
+    epoch_C_D      = 0.0
+    epoch_phi1_err = 0.0
+    epoch_Um_err   = 0.0
+
+    for cond in dataset:
+        # Forward pass + gradients
+        (loss_val, aux), grads = eqx.filter_value_and_grad(
+            loss_fn, has_aux=True
+        )(
+            network, cond, n_window, dt_fixed,
+            dx, D, d_b, mu1, mu2, theta, N
+        )
+
+        phi1_pred, Um_pred, C_D_pred = aux
+
+        # Update weights
+        updates, opt_state = optimizer.update(
+            eqx.filter(grads,   eqx.is_array),
+            opt_state,
+            eqx.filter(network, eqx.is_array),
+        )
+        network = eqx.apply_updates(network, updates)
+
+        # Accumulate metrics
+        epoch_loss     += float(loss_val)
+        epoch_C_D      += float(C_D_pred)
+        epoch_phi1_err += abs(float(phi1_pred) - cond['phi1_target']) \
+                          / (cond['phi1_target'] + 1e-10) * 100
+        epoch_Um_err   += abs(float(Um_pred) - cond['Um_sim']) \
+                          / (cond['Um_sim'] + 1e-10) * 100
+
+    # Average across conditions
+    n            = len(dataset)
+    avg_loss     = epoch_loss     / n
+    avg_C_D      = epoch_C_D      / n
+    avg_phi1_err = epoch_phi1_err / n
+    avg_Um_err   = epoch_Um_err   / n
+
+    if epoch % print_every == 0 or epoch == n_epochs - 1:
+        print(f"Epoch {epoch:4d}  "
+              f"loss={avg_loss:.6f}  "
+              f"C_D={avg_C_D:.4e}  "
+              f"true={drag_coeff:.4e}  "
+              f"ratio={avg_C_D/drag_coeff:.3f}  "
+              f"phi1_err={avg_phi1_err:.2f}%  "
+              f"Um_err={avg_Um_err:.2f}%")
+
+
+    # ── Final evaluation ───────────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"Final evaluation")
+    print(f"Target C_D = {drag_coeff:.6e}")
+    print(f"{'='*60}")
+    print(f"{'WC':>5}  {'Um':>5}  {'C_D_learned':>14}  "
+        f"{'ratio':>7}  {'phi1_err%':>10}  {'Um_err%':>8}")
+    print("-" * 60)
+
+    for cond in dataset:
+        x = build_network_inputs(
+            jnp.array(cond['WC']),
+            jnp.array(cond['u1_mean']),
+            jnp.array(cond['u2_mean']),
+        )
+        C_D_final = float(network(x))
+        ratio     = C_D_final / drag_coeff
+
+        (_, (phi1_pred, Um_pred, _)), _ = eqx.filter_value_and_grad(
+            loss_fn, has_aux=True
+        )(network, cond, n_window, dt_fixed, dx, D, d_b, mu1, mu2, theta, N)
+
+        phi1_err = abs(float(phi1_pred) - cond['phi1_target']) \
+                / (cond['phi1_target'] + 1e-10) * 100
+        Um_err   = abs(float(Um_pred) - cond['Um_sim']) \
+                / (cond['Um_sim'] + 1e-10) * 100
+
+        print(f"{cond['WC']:>5.1f}  "
+            f"{cond['Um_target']:>5.2f}  "
+            f"{C_D_final:>14.6e}  "
+            f"{ratio:>7.3f}  "
+            f"{phi1_err:>9.2f}%  "
+            f"{Um_err:>7.2f}%")
+
+    # ── Save trained network ───────────────────────────────────────────────────────
+    eqx.tree_serialise_leaves("drag_network_phase1.eqx", network)
+    print(f"\nTrained network saved to drag_network_phase1.eqx")
+    
+    
+    # ══════════════════════════════════════════════════════════════════════════════
+    # Section 7c — Validation of spinup and plateau extraction (to confirm grads work before adding NN)
+    # ══════════════════════════════════════════════════════════════════════════════
+    '''
+    i_start = N // 4
+    i_end   = 3 * N // 4
+
+    phi1_p  = final_state['phi1'][i_start:i_end]
+    phi2_p  = final_state['phi2'][i_start:i_end]
+    u1_p    = final_state['u1'][i_start:i_end]
+    u2_p    = final_state['u2'][i_start:i_end]
+    rho1_p  = final_state['rho1'][i_start:i_end]
+    rho2_p  = final_state['rho2'][i_start:i_end]
+
+    phi1_plateau = float(jnp.mean(phi1_p))
+    u1_mean      = float(jnp.mean(u1_p))
+    u2_mean      = float(jnp.mean(u2_p))
+    Um_vol       = float(jnp.mean(phi1_p * u1_p + phi2_p * u2_p))
+    rho_mix_p    = phi1_p * rho1_p + phi2_p * rho2_p
+    Um_mom       = float(jnp.mean(
+        (phi1_p * rho1_p * u1_p + phi2_p * rho2_p * u2_p)
+        / (rho_mix_p + 1e-10)
+    ))
+
+    Um_target = 0.50   # update per test condition
+
+    print(f"\n{'='*45}")
+    print(f"  phi1 plateau:   {phi1_plateau:.4f}  (input was {phi1_inlet_bc:.4f})")
+    print(f"  u1 (water):     {u1_mean:.4f} m/s")
+    print(f"  u2 (oil):       {u2_mean:.4f} m/s")
+    print(f"  slip (u2-u1):   {u2_mean - u1_mean:+.4f} m/s")
+    print(f"  U_m vol:        {Um_vol:.4f} m/s")
+    print(f"  U_m momentum:   {Um_mom:.4f} m/s")
+    print(f"  U_m target:     {Um_target:.4f} m/s")
+    print(f"  Error (vol):    {(Um_vol  - Um_target)/Um_target*100:+.2f}%")
+    print(f"  Error (mom):    {(Um_mom  - Um_target)/Um_target*100:+.2f}%")
+    print(f"{'='*45}")
+
+    # ── Gradient flow sanity check ─────────────────────────────────────────────────
+    # Verify jax.grad can differentiate through the window before adding NN.
+    # Run this once after the loop to confirm infrastructure is ready.
+
+    def gradient_check(spinup_state, drag_coeff_val):
+        """
+        Check that d(phi1_plateau)/d(drag_coeff) is nonzero.
+        If zero: gradients are not flowing — fix before adding network.
+        If nonzero: infrastructure is ready for neural network.
+        """
+        def loss_from_drag(drag_c):
+            # Tiny 500-step scan with drag_c as differentiable input
+            def step(s, dt):
+                new_s = time_step(
+                    s, dt, dx, drag_c, D,
+                    p_inlet, p_outlet, d_b,
+                    mu1, mu2, theta, phi1_inlet_bc
+                )
+                return new_s, None
+
+            final, _ = jax.lax.scan(
+                step,
+                spinup_state,
+                jnp.full(500, dt_fixed),
+            )
+            return jnp.mean(final['phi1'][N//4:3*N//4])
+
+        grad = jax.grad(loss_from_drag)(jnp.array(drag_coeff_val))
+        print(f"\nGradient check:")
+        print(f"  d(phi1)/d(drag_coeff) = {float(grad):.6e}")
+        if abs(float(grad)) > 1e-12:
+            print(f"  ✓ Gradients flowing — ready for neural network")
+        else:
+            print(f"  ✗ Zero gradient — investigate before adding network")
+        return grad
+
+    gradient_check(spinup_state, drag_coeff)
+    '''
+    
+    '''
     while t < t_end:
         # Compute stable dt from CFL condition (adaptive time stepping)
         dt = float(compute_dt(state, dx, mu1, mu2, rho1_val, rho2_val, cfl=0.4, dt_max=1e-4))
@@ -1232,39 +1888,19 @@ if __name__ == "__main__":
                     f"phi2 min={float(state['phi2'].min()):.6f} "
                     f"phi2 max={float(state['phi2'].max()):.6f}")
                 
-
-        '''
-        # Add this — print dp diagnostic for first 5 steps
-        # Check for blowup every step — stop when it first appears
-        u2_max = float(jnp.max(jnp.abs(state['u2'])))
-        u1_max = float(jnp.max(jnp.abs(state['u1'])))
-        
-        if u2_max > 10.0 * u1_max:   # u2 more than 10x u1 — something wrong
-            print(f"\nBLOWUP DETECTED at step={step_n} t={t:.6f}")
-            print(f"  u1_max = {u1_max:.4e}")
-            print(f"  u2_max = {u2_max:.4e}")
-            print(f"  dt     = {dt:.4e}")
-            print(f"  phi2:  min={float(state['phi2'].min()):.6f} "
-                f"max={float(state['phi2'].max()):.6f}")
-            print(f"  phi1:  min={float(state['phi1'].min()):.6f} "
-                f"max={float(state['phi1'].max()):.6f}")
-            
-            
-            # Print the spatial profile of u2 at blowup
-            print(f"\n  u2 profile at blowup:")
-            u2_arr = jnp.abs(state['u2'])
-            worst_idx = int(jnp.argmax(u2_arr))
-            print(f"  worst cell: index={worst_idx} "
-                f"x={float(x[worst_idx]):.3f}m "
-                f"u2={float(state['u2'][worst_idx]):.4e}")
-            break
-        '''
-        
+    '''
         
 
     print(f"\nDone. {step_n} steps completed.")
     
-    # --- Visualization ---
+
+    
+    ############################################
+        
+    # ══════════════════════════════════════════════════════════════════════════════
+    # Section 8 — Visualization of results
+    # ══════════════════════════════════════════════════════════════════════════════
+    '''
     fig, axes = plt.subplots(3, 1, figsize=(10, 10))
     fig.patch.set_facecolor('#0f0f1a')
     x_np = np.array(x)
@@ -1330,7 +1966,7 @@ print(f"u2 (oil):        {u2_plateau:.4f} m/s")
 print(f"U_m predicted:   {U_m_predicted:.4f} m/s")
 print(f"U_m target:      0.5000 m/s")
 print(f"Error:           {(U_m_predicted - 0.5)/0.5 * 100:.2f}%")
-
+'''
 # =============================================================================
 # APPENDIX: UPGRADING TO RK2 TIME INTEGRATION
 # =============================================================================
