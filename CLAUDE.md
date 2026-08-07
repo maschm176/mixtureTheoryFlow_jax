@@ -74,6 +74,25 @@ grid-resolved). Full details of both under "Completed Phases" below.
    values), revisit the numerical scheme — a shock-capturing/flux-limited
    scheme would resolve the traveling wave more cleanly than the current
    Lax-Friedrichs setup. Not needed for the current goal.
+7. Phase 2a single-scalar C_D training (Section 7c) plateaued at a clear,
+   informative pattern rather than a noisy one: pre-inversion (positive
+   target slip) conditions fit well, post-inversion (negative target slip)
+   conditions all land at the *correct sign* but ~4-5x too small a
+   magnitude. That's consistent with the two regimes needing genuinely
+   different effective drag — something one shared constant C_D structurally
+   cannot represent, no matter how well-optimized. Added a lightweight
+   two-parameter test (Section 7d) as a cheap intermediate check before
+   committing to a full Phase 2b: two independent scalars, `C_D_pos` and
+   `C_D_neg`, split by the *sign of each condition's own experimentally-
+   measured target slip* (not learned — the data already tells us which
+   physical regime a condition is in). Kept fully separate from the
+   1-parameter baseline (own variables, own checkpoint files) so both
+   results stay directly comparable. If both regimes fit well with their
+   own dedicated scalar, that's direct evidence the fix needs a regime-
+   dependent closure, strengthening the case for Phase 2b; if one regime
+   still struggles even with its own parameter, the remaining gap isn't
+   simply "pre- vs. post-inversion." **Not yet run/evaluated as of this
+   note** — see Section 7d output for results once available.
 
 ---
 
@@ -495,6 +514,14 @@ Phase 2c:  larger dataset    → learn full M1       → loss: phi1 + u1
 Note: richer M1 (Phase 2b/2c) does not by itself resolve the vanishing-phase
 singularity that bounds usable WC range (e.g. WC=0.1) -- see "Current
 Limitation: Vanishing-Phase Singularity" under Known Issues.
+
+Note: before committing to full Phase 2b, a much lighter intermediate test
+was added (Section 7d) — two independent C_D scalars (`C_D_pos`/`C_D_neg`)
+instead of one, split by the sign of each condition's target slip
+(pre-/post-inversion), rather than a full NN-learned M1. This directly tests
+whether the single-scalar plateau (see Current Status, item 7) is a
+regime-dependence problem specifically, before paying the cost of the full
+Phase 2b effort.
 
 ### Why Learn C_D First (Not Full M1)
 
