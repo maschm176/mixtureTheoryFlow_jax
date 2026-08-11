@@ -23,11 +23,14 @@
 ## Current Status
 
 Phase 1 (scalar C_D optimization) is validated. The wall friction closure has
-been swapped to per-phase Blasius (enables phase inversion), the resulting
-vanishing-phase NaN has been fixed via an explicit single-phase collapse, and
-the traveling-wave instability this revealed near/past inversion (WC≈0.7) has
-been characterized (real physics, bulk-advection-driven, not yet cleanly
-grid-resolved). Full details of both under "Completed Phases" below.
+been swapped from per-phase Blasius (D_h_i = D*phi_i) to Taitel-Dukler
+stratified segment geometry, after the Blasius version was found to badly
+over-penalize whichever phase is the minority. The vanishing-phase NaN (from
+the original Darcy-Weisbach → Blasius swap) was fixed via an explicit
+single-phase collapse, and the traveling-wave instability that swap had
+revealed near/past inversion (WC≈0.7) is no longer observed since switching
+to Taitel-Dukler — confirmed via grid convergence (N=250/500/1000) on a
+previously-affected condition. Full details under "Completed Phases" below.
 
 **Next steps (Phase 2a real-data training, blocked on this work):**
 
@@ -74,6 +77,13 @@ grid-resolved). Full details of both under "Completed Phases" below.
    values), revisit the numerical scheme — a shock-capturing/flux-limited
    scheme would resolve the traveling wave more cleanly than the current
    Lax-Friedrichs setup. Not needed for the current goal.
+   **Update**: the traveling wave that motivated this item is no longer
+   observed after switching wall friction to Taitel-Dukler (see "Wall
+   friction upgrade" under Completed Phases) — confirmed at N=250/500/1000
+   on a previously-affected condition. Downgrading from "known open
+   numerical issue" to "watch for recurrence once the full condition sweep
+   is re-run"; not deleting this item since it's only been checked on one
+   condition so far, not the full real-data set.
 7. Phase 2a single-scalar C_D training (Section 7c) plateaued at a clear,
    informative pattern rather than a noisy one: pre-inversion (positive
    target slip) conditions fit well, post-inversion (negative target slip)
@@ -240,6 +250,97 @@ characterization)**
   current Lax-Friedrichs scheme. Practical mitigation: avoid extracting
   training plateau values from windows where this oscillation is actively
   occurring, rather than upgrading to a shock-capturing scheme right now.
+- **Superseded**: this traveling-wave/collapse behavior is no longer
+  observed after switching wall friction to the Taitel-Dukler stratified
+  geometry — see "Wall friction upgrade: Taitel-Dukler stratified geometry"
+  below.
+
+**Wall friction upgrade: Taitel-Dukler stratified geometry (replacing
+per-phase Blasius's naive D*phi_i scaling)**
+- Trigger: a single scalar C_D (and even a two-parameter C_D_pos/C_D_neg
+  split by pre-/post-inversion sign) plateaued on real Ibarra conditions
+  with a clean, informative pattern rather than noise — low-WC conditions
+  fit to 2-7% error, high-WC conditions (WC=0.7@Um=0.50, WC=0.7@Um=0.75,
+  WC=0.8@Um=0.75) all landed at the *correct sign* but 60-82% too small in
+  magnitude. A zero-drag-ceiling diagnostic (forcing C_D→0 on the struggling
+  conditions) showed even zero drag only reached 22-40% of the target |slip|
+  — proof no drag closure of the "positive coefficient × |Δu|·Δu" form
+  (scalar, per-regime, or a future NN-learned M1) could ever close that
+  gap, since such a closure can only shrink slip, never create it. The
+  bottleneck had to be non-drag physics.
+- Cross-checked the struggling conditions against Ibarra's own flow pattern
+  map (Figure 6, from the source PDF): none are dual-continuous (ruling out
+  a fundamental 2D/3D representation limit this 1D model genuinely
+  couldn't capture); all are SWD (stratified wavy with droplets) — the
+  *same* nominal regime as a well-fitting low-WC condition (WC=0.3@Um=0.75).
+  So the failure tracked water cut continuously within one regime, not a
+  qualitative regime boundary — pointing specifically at the wall friction
+  closure's geometry assumption, not at flow-pattern-dependent physics
+  the model was missing entirely.
+- Root cause: the per-phase Blasius friction (previous entry) used
+  D_h_i = D*phi_i — implicitly modeling each phase as flowing through its
+  own smaller circular sub-pipe scaled by volume fraction. This geometry
+  has no relationship to the real stratified picture (two circular
+  segments split by a flat interface, water pooled at the bottom, oil
+  layered on top) and badly underestimates the true hydraulic diameter of
+  whichever phase is the minority — verified numerically to be off by up
+  to ~3.9x at a 90/10 split — because a real thin segment's wall-contact
+  arc length shrinks much more slowly than its area does, something the
+  naive linear phi_i scaling has no way to represent.
+- Fix: derived the actual Taitel-Dukler circular-segment geometry. The
+  water segment's half-angle phi_angle relates to its area fraction via
+  the transcendental equation
+  `phi1 = (phi_angle - sin(phi_angle)*cos(phi_angle)) / pi`,
+  solved with 6 unrolled Newton-Raphson iterations (verified to converge
+  to machine precision, residuals ~1e-16, across the whole
+  PHI_COLLAPSE-bounded range) to give closed-form hydraulic diameters
+  `D_h1 = pi*D*phi1/phi_angle`, `D_h2 = pi*D*phi2/(pi-phi_angle)`. Confirmed
+  both algebraically and numerically that the result is independent of
+  which phase is arbitrarily assigned the "bottom" role in the derivation
+  (a circle's mirror symmetry guarantees this) — so the fix only assumes
+  the flow is genuinely stratified into two segments (true for the SWD
+  conditions in question, per the Figure 6 check above), not any
+  particular phase ordering.
+- Everything downstream of D_h1/D_h2 (Re1/Re2, the Blasius/laminar f_D
+  switch, both friction formulas, the PHI_COLLAPSE collapse override) was
+  left unchanged — the existing friction formula's functional form was
+  already dimensionally correct in general, it just needed the right
+  D_h_i plugged in.
+- Verified in stages before touching the live simulation: (1) isolated
+  geometry solve — symmetric-point check (D_h1=D_h2=D_pipe exactly at
+  phi1=0.5) and Newton convergence both passed; (2) isolated gradient
+  check — jax.grad through the geometry solve stays finite everywhere,
+  correct sign (dD_h1/dphi1>0, dD_h2/dphi1<0) in the interior; (3) wired
+  into advance_momentum and re-ran both the forward pass and the gradient
+  chain (d(loss)/d(drag_coeff), d(loss)/d(phi1)) directly — all finite,
+  no NaN.
+- Result: after the switch, the traveling-wave oscillation-to-crash
+  behavior from the previous entry (recurring phi2 spike-and-crash near
+  WC=0.7) is no longer observed. Confirmed via the grid convergence check
+  (N=250/500/1000) re-run on a previously-affected (collapsing) condition
+  — all three resolutions are free of oscillation and structurally
+  consistent with each other.
+- Why this isn't a coincidental side effect: near a vanishing phase, the
+  naive formula's D_h_i ~ phi_i (linear) makes friction (~1/D_h_i) blow up
+  as a first-order pole in 1/phi_i. The Taitel-Dukler geometry's
+  D_h_i ~ phi_i^(2/3) near the same limit (from the small-angle expansion
+  of the segment-area equation) is a much gentler falloff, so friction
+  only blows up as phi_i^(-2/3) — a weaker singularity. That directly
+  reduces both the runaway minority-phase deceleration that was driving
+  phase collapse, and the friction-nonlinearity-driven steepening
+  implicated in the traveling wave's shock-like spikes — the same
+  underlying fix plausibly explains both improvements at once.
+- Not yet done: confirmed on one previously-problematic condition across
+  three resolutions, not yet the full sweep across all conditions in
+  ibarra_phase2a_dataset.csv. Phase 2a next-steps item 1 (sweep every real
+  condition for oscillation) should be re-run under this new friction
+  model before assuming the existing collapse/oscillation exclusion gates
+  are no longer needed for any condition — expected to trigger far less
+  often (if at all), but to be confirmed rather than assumed. Also expect
+  the resulting quiet-window timing to now correlate with Um (bulk transit
+  time L/Um) rather than being erratic per-condition, which would
+  meaningfully simplify generate_real_dataset's per-condition window
+  selection (Current Status item 5) if confirmed.
 
 ---
 
