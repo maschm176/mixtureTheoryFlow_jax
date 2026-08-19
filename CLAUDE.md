@@ -30,7 +30,11 @@ the original Darcy-Weisbach → Blasius swap) was fixed via an explicit
 single-phase collapse, and the traveling-wave instability that swap had
 revealed near/past inversion (WC≈0.7) is no longer observed since switching
 to Taitel-Dukler — confirmed via grid convergence (N=250/500/1000) on a
-previously-affected condition. Full details under "Completed Phases" below.
+previously-affected condition. An interfacial term (S_i) with tunable weight
+w was subsequently added to the Taitel-Dukler closure to fix a separate
+sign-crossing-location problem, and w has been fit against real data
+(w=0.4920, holding out two near-inversion conditions). Full details under
+"Completed Phases" below.
 
 **Next steps (Phase 2a real-data training, blocked on this work):**
 
@@ -103,6 +107,67 @@ previously-affected condition. Full details under "Completed Phases" below.
    still struggles even with its own parameter, the remaining gap isn't
    simply "pre- vs. post-inversion." **Not yet run/evaluated as of this
    note** — see Section 7d output for results once available.
+   **Superseded**: this sign-mismatch question ended up being answered by a
+   separate, deeper investigation instead of by running this test — see
+   "Interfacial term (S_i) added to Taitel-Dukler wall friction" under
+   Completed Phases. That work established that M1/drag is *structurally*
+   incapable of moving *where* slip crosses zero — it's built to vanish at
+   slip=0 (M1 = C_D·|Δu|·Δu), so it can only shrink slip magnitude, never
+   relocate the zero-crossing. No number of regime-specific C_D scalars
+   (one, two, or a future NN) could ever fix a mismatch caused by the
+   zero-crossing itself sitting at the wrong WC — only non-drag physics
+   (wall friction, pressure) sets that location. The real root cause was the
+   wall-friction closure's geometry, not drag being insufficiently
+   regime-aware. Section 7d's `C_D_pos`/`C_D_neg` split was never run — it's
+   superseded rather than completed, since the premise motivating it turned
+   out to be incomplete.
+8. Current active step: refit the single scalar C_D against real Ibarra
+   slip targets, holding w fixed at its now-converged value (0.4920 — see
+   Completed Phases), reusing the original Phase 1/2a jax.grad-based scalar
+   optimization pattern (short spinup + short differentiable window near the
+   plateau) — not the finite-difference approach used for w, which was
+   specifically needed because w's effect on slip only becomes visible after
+   the full ~37s transient settles, unlike C_D's, which is visible locally
+   near the plateau within a short window.
+   **Redirected**: attempting this refit surfaced a deeper problem before it
+   could even be evaluated meaningfully — see "C_D refit surfaces a
+   fundamental ceiling..." under Completed Phases. C_D ran away (1.0 → 18.6
+   over 30 epochs) toward a degenerate "predict zero slip everywhere"
+   solution instead of converging to a real fit, traced to most real
+   conditions being structurally unreachable by C_D alone regardless of its
+   value — the achievable |slip| ceiling (at C_D→0) is set entirely by
+   non-drag physics (wall friction, pressure), which C_D can only ever
+   shrink below, never exceed. This refit is paused, not abandoned — worth
+   revisiting once wall friction magnitude (item 9) is better calibrated and
+   the ceiling itself has moved.
+9. New active step: wall friction MAGNITUDE (distinct from the stratified
+   distribution S_i/w already addresses) is now understood to be the actual
+   binding constraint on both Um accuracy and achievable slip range — see
+   "C_D refit surfaces a fundamental ceiling..." under Completed Phases,
+   including a literature check confirming this is a known, actively-studied
+   limitation of stratified two-fluid models generally (Rodriguez & Oliemans
+   2006, Chakrabarti et al. 2005, Ng et al. 2004), not an artifact specific
+   to this project. Planned: fit phase-specific friction multipliers k1
+   (water) and k2 (oil) — applied unconditionally in every condition, not
+   regime-switched, mirroring the phase split D_h1/D_h2 already has — via
+   the same jax.grad scalar-optimization pattern already validated for w and
+   C_D, as a cheap test before considering a richer NN-learned friction
+   correction. Not yet implemented; user is reviewing the referenced
+   literature first before deciding on the exact functional form.
+   **Result**: fit succeeded — k1=0.6523, k2=0.9458 (see "Phase-specific
+   wall friction magnitude multipliers..." under Completed Phases). Average
+   Um error across the 9 trained conditions dropped to ~3.2% (from ~15.0% at
+   w alone), every one under 10%, all signs unchanged from the w fit.
+   Confirms wall friction magnitude, not drag closure choice, was the
+   dominant remaining error source.
+10. New active step: (1) bake k1=0.6523/k2=0.9458 in as new defaults in
+    advance_momentum/time_step_learned (same treatment already given to
+    w=0.4920), (2) re-run the zero-drag-ceiling sweep (see "C_D refit
+    surfaces a fundamental ceiling..." under Completed Phases) under this
+    improved friction closure to check whether the previously-unreachable
+    conditions are now reachable, before (3) deciding whether to resume the
+    paused C_D refit (item 8) now that its binding ceiling has likely
+    moved. Not yet done.
 
 ---
 
@@ -341,6 +406,249 @@ per-phase Blasius's naive D*phi_i scaling)**
   time L/Um) rather than being erratic per-condition, which would
   meaningfully simplify generate_real_dataset's per-condition window
   selection (Current Status item 5) if confirmed.
+
+**Interfacial term (S_i) added to Taitel-Dukler wall friction, weight w fit
+to real data**
+- Trigger: even after the Taitel-Dukler switch, several real conditions
+  still showed a slip *sign* mismatch. Traced this to the simulated
+  inversion point (the WC where slip crosses zero) sitting at a different
+  location than the experimental one — e.g. simulated ≈0.72-0.75 vs.
+  experimental ≈0.47 at Um=0.75 — not to residual drag insufficiency.
+- Established a structural fact that reframed the whole problem: M1/drag is
+  built to vanish at zero slip (M1 = C_D·|Δu|·Δu), so it can only shrink
+  slip magnitude, never move *where* it crosses zero. Only non-drag physics
+  (wall friction, pressure) sets that location. This means Current Status
+  item 7's planned `C_D_pos`/`C_D_neg` two-parameter test could never have
+  fixed a zero-crossing-location mismatch regardless of its outcome, since
+  it only varies drag by regime, not the crossing location itself — see the
+  "Superseded" note on that item.
+- Fix: added the interfacial chord term S_i = D·sin(phi_angle) — the chord
+  length of the flat interface between the two circular segments — to oil's
+  wetted perimeter in the Taitel-Dukler hydraulic diameter, weighted by a
+  tunable scalar w ∈ [0,1]:
+  `D_h2 = pi*D*phi2/(pi - phi_angle + w*sin(phi_angle) + eps)`.
+  w=0 recovers the original unweighted Taitel-Dukler geometry; w=1 is the
+  literature convention of treating the full interfacial chord as if it
+  were solid wall contact for the lighter/faster phase.
+- Manually hand-tested w=1.0, 0.7, 0.4 against real data: higher w fixed
+  more sign mismatches (w=1.0 fixed all 11) but increasingly inflated a
+  pre-existing Um deficit — a monotonic tradeoff, not independent knobs.
+- Built a rigorous gradient-based fitting procedure for w, reusing Phase 1's
+  scalar-optimization scaffolding: Adam over an unconstrained variable z,
+  with w = sigmoid(z) keeping it bounded in (0,1) by construction.
+- Kernel crash, then fix: unlike C_D (whose effect on slip is visible in a
+  short differentiable window near the plateau), w's effect only becomes
+  visible after the full ~37s transient has settled, so directly
+  differentiating (jax.grad) through the required ~370,000-step scan needed
+  memory proportional to the full step count — confirmed via direct memory
+  profiling (50,000 differentiated steps alone used ~8GB; nested
+  jax.checkpoint didn't meaningfully reduce this). Fixed by switching to
+  central finite-difference gradients for this one scalar: three
+  forward-only simulations per gradient step (center, w+h, w-h), which need
+  no memory proportional to step count (confirmed: the full 370,000-step
+  forward pass uses ~300MB). This is scoped specifically to w — C_D
+  refitting still uses jax.grad through the original short window and was
+  never affected by this issue.
+- First fit, all 11 real conditions: converged to w=0.9811 — essentially
+  independently rediscovering the literature convention (w≈1) via gradient
+  descent rather than by hand. Fixed all 11 sign mismatches, but pushed
+  average |Um error| to ~20.2% (up from ~8.5% at w=0), and *every single*
+  condition's Um error measurably worsened as w increased from 0 to 0.98 —
+  confirming the additive S_i term inflates total friction broadly, not
+  just the relative balance between phases.
+- Diagnostic sweep (w = 0, 0.3, 0.5, 0.7, 0.9811) showed 9 of 11 conditions
+  already have the correct sign by w=0.5, with no further improvement
+  between w=0.5 and w=0.7 — only two conditions (WC=0.40 and WC=0.50 @
+  Um=0.50) remain mismatched that whole range, only flipping once w is
+  pushed to ~0.98. These two also have by far the smallest-magnitude slip
+  targets in the dataset (-0.0608, -0.0148 m/s), and WC=0.50 is exactly the
+  phase-inversion point this document already flags elsewhere as a regime
+  "no simple two-fluid model handles well."
+- Decision: excluded these two near-inversion conditions from the w fit
+  entirely (`NEAR_INVERSION_EXCLUDE`) — same exclusion logic already used
+  for phase-collapsed conditions. Chasing an exact sign on a near-zero
+  target in a regime the model is known not to resolve isn't worth the Um
+  cost it imposes on every other condition.
+- Refit against the remaining 9 conditions: converged to w=0.4920. All 9
+  trained conditions now have the correct sign; average |Um error| = 15.0%
+  (down from 20.2% at w=0.9811), range -3.7% to -22.1%.
+- Not resolved by this work, flagged as open: a meaningful share of the
+  residual ~15% Um error predates S_i entirely — several of the same
+  conditions already showed comparable errors (up to -15%) at w=0, pointing
+  to a Taitel-Dukler base friction magnitude issue independent of the
+  interfacial term. C_D refitting won't address this either, since wall
+  friction dominates Um by ~54,000x (see "Current Limitation: Drag
+  Insensitivity" under Known Issues) — a separate, later item, not blocking
+  the current C_D refit.
+
+**C_D refit surfaces a fundamental ceiling: wall friction magnitude, not
+drag closure choice, is the binding constraint**
+- Trigger: attempted the Phase 2a C_D refit (Section 7c) against real data,
+  holding w fixed at 0.4920. Instead of converging, C_D ran away (1.0 →
+  18.6 over 30 epochs) while every condition's slip_pred shrank toward zero
+  and the average loss crept toward ~1.0 — the "predict slip=0 everywhere"
+  asymptote — rather than actually improving. Final state: mean slip error
+  100.32% ± 3.22% across all 11 conditions — essentially uniform failure
+  disguised as "loss decreasing."
+- Diagnosed the mechanism: the loss is normalized by |slip_target|, so a
+  badly sign-mismatched condition's error falls toward the 100% floor as
+  its prediction shrinks toward zero (looks like improvement), while every
+  correctly-signed condition's error *rises* toward that same floor from
+  below as its already-too-small prediction shrinks further away from
+  target. One early sign-mismatched outlier dominated the average loss at
+  first, masking that the whole population was collectively converging to
+  the same degenerate zero-slip solution, not to a real fit.
+- Root structural cause: M1 is a pure damping force
+  (M1 = C_D·|Δu|·Δu, coefficient ≥ 0 by construction) — it can only ever
+  shrink |slip| below whatever the non-drag physics (wall friction +
+  pressure) produces at C_D=0; it can never grow slip beyond that
+  "zero-drag ceiling." C_D started at 1.0 (10,000x the physically-motivated
+  reference value, drag_coeff=1e-4) — already deep into a regime where drag
+  rivals or exceeds wall friction in magnitude — so there was no direction
+  left to move except toward the degenerate collapse.
+- Built a diagnostic sweeping slip_pred vs. C_D (1e-6 to 1e2, log-spaced)
+  across all 11 real conditions, reusing each condition's cached
+  real_dataset spinup_state — a direct extension of the earlier "neg-group"
+  zero-drag-ceiling check (git commit 57a611c) to the full dataset. Result:
+  most conditions are structurally unreachable by C_D alone, specifically
+  WC=0.6/0.7/0.8 @ Um=0.50 and the post-inversion WC points @ Um=0.75 —
+  exactly the same conditions carrying the largest Um error in the w-fit
+  evaluation table. Not a coincidence: both symptoms trace to the same root
+  cause.
+- Key structural realization, broader than just this formula: at C_D→0,
+  M1→0 regardless of which formula computed the coefficient — dispersed
+  bubble, stratified interfacial, a regime-split scalar, or a full
+  NN-learned coefficient (as long as it's architecturally constrained
+  non-negative, which the existing DragClosureNetwork's softplus output
+  enforces on purpose). All of them collapse to the identical zero-drag
+  simulation at that limit. This means the achievable slip ceiling is set
+  ENTIRELY by non-drag physics and is invariant to which drag closure is
+  chosen — so neither switching to the stratified interfacial drag formula
+  originally planned for Phase 2b, nor a full NN-learned M1, would resolve
+  the unreachable conditions. Both would hit the identical ceiling for the
+  identical reason.
+- Decision: redirect focus toward wall friction MAGNITUDE (distinct from
+  the geometric/distributional S_i/w work already done) as the actual
+  binding constraint, rather than continuing to refine the drag closure.
+  Planned next step: fit phase-specific friction multipliers k1 (water) and
+  k2 (oil) — `friction1_learned = k1*friction1`, `friction2_learned =
+  k2*friction2` — applied unconditionally in every condition (a structural
+  per-phase distinction that already exists in the code, same spirit as
+  D_h1/D_h2, not a regime-switched branch), fit jointly via the same
+  jax.grad scalar-optimization pattern already validated for w and C_D. A
+  cheap scalar test before considering a richer NN-learned friction
+  correction, same "cheap test before full commitment" philosophy already
+  used for w before S_i, and originally intended for C_D_pos/C_D_neg before
+  Phase 2b.
+- Literature check: searched for prior work on this exact issue before
+  committing further effort, given how confidently the physics pointed at
+  wall/interfacial friction. Found strong, direct confirmation this is a
+  known, actively-studied limitation of stratified two-fluid models
+  generally, not an artifact of this project's implementation:
+  - Rodriguez & Oliemans (2006): two-fluid model errors for stratified
+    oil-water flow average 20-40%, exceeding 100% in some cases — closely
+    matches this project's own error magnitudes.
+  - Chakrabarti et al. (2005): pressure gradient predictions vary 40-200%
+    depending on which closure relations are chosen.
+  - Ng et al. (2004): oil-water wall/interfacial equivalent friction
+    factors are "quite inconsistent" and "difficult to formulate" — the
+    same conclusion reached independently here via the S_i/w investigation.
+  - Taitel & Dukler's original 1976 formulation assumed a *constant* ratio
+    between interfacial and wall friction factor — a simplification the
+    literature has identified ever since as the model's primary weakness,
+    causing regime-dependent over/under-prediction of holdup. This is
+    effectively the exact gap the S_i/w term patches, independently
+    rediscovered here rather than sourced from the literature.
+  - Rodriguez & Oliemans improved accuracy to ~35% error specifically by
+    incorporating interfacial wave roughness — physically consistent with
+    the struggling conditions here being independently classified as SWD
+    (stratified wavy *with droplets*) via the Figure 6 cross-check done
+    earlier (see "Wall friction upgrade" entry above).
+  - A 2023 Petroleum Science paper ("Prediction of pressure gradient and
+    hold-up in horizontal liquid-liquid pipe flow") reached much better
+    accuracy (mean error -7.06%, std 20.72%) by modifying friction
+    correlations for oil viscosity, interfacial curvature, and phase
+    fraction jointly, rather than a single flat multiplier — a useful
+    reference point for how far a well-designed closure can go, and a
+    caution that k1/k2 (two flat scalars) may not be the final answer if it
+    doesn't close enough of the gap.
+- Not yet done: the k1/k2 friction-magnitude fit itself (planned next step,
+  not yet implemented). User is reading the referenced literature first
+  (Rodriguez & Oliemans 2006, the 2023 Petroleum Science paper, and
+  re-checking Ibarra et al.'s own discussion section) before deciding
+  whether a flat multiplier or a richer functional correction is the right
+  starting point.
+
+**Phase-specific wall friction magnitude multipliers (k1/k2) fit to real
+data — closes most of the residual Um gap**
+- Trigger: both the C_D-refit ceiling diagnostic and the literature search
+  (previous entry) pointed to wall friction MAGNITUDE — distinct from the
+  distributional/geometric fix S_i/w already made — as the actual binding
+  constraint on Um accuracy and achievable slip range.
+- Fix: added two independent multiplicative scalars, k1 (water) and k2
+  (oil), applied unconditionally to each phase's finalized friction term
+  (after the PHI_COLLAPSE collapse override, before it enters the momentum
+  update): `friction1_learned = k1*friction1`, `friction2_learned =
+  k2*friction2`. Defaults of 1.0 leave physics unchanged unless overridden
+  — a structural per-phase distinction that already existed in the code
+  (mirroring D_h1/D_h2), not a regime-switched branch.
+- Fitting procedure: reused w's exact scaffolding (fresh initial_conditions
+  each trial, full N_TOTAL_STEPS=370,000-step forward-only pass,
+  finite-difference gradients — the same OOM reasoning as w applies, since
+  k1/k2 are wall-friction parameters whose effect likewise only fully
+  develops after the full ~37s transient settles) generalized to two
+  parameters: a 2D central finite difference needs 5 forward evaluations
+  per gradient step (center, k1±h, k2±h) instead of w's 3, ~1.7x the
+  per-epoch cost (~11 min/epoch at 11 conditions). Reparameterized in
+  log-space (k=exp(z)) like C_D, since k must stay positive with no natural
+  upper bound (unlike w's bounded-(0,1) sigmoid). Loss identical in
+  structure to w's: Um relative error squared + sign-preservation penalty,
+  no explicit slip-magnitude term. Reused w_fit_conditions directly (same
+  collapsed + near-inversion exclusions); deliberately did NOT exclude the
+  conditions found unreachable by the C_D ceiling sweep, since raising
+  their ceiling was the whole point of this fit.
+- First attempt (lr=0.3, 5 epochs, starting k1=k2=1.0 — "no correction"):
+  clearly unstable. k1 and k2 oscillated in opposite directions each epoch
+  (k1: 1.25→0.96→0.56→0.88→1.07; k2: 0.57→0.78→1.36→0.92→0.72), loss was
+  non-monotonic (epoch 1 got worse before partially recovering), mismatches
+  bounced 3→5→2→2→2. Diagnosed as the learning rate being too large for two
+  COUPLED parameters that both influence the same Um — a per-parameter step
+  reasonable in isolation can combine into an overshoot in the joint
+  (k1, k2) space. lr=0.3 had worked fine for w and C_D, both single,
+  less-coupled parameters.
+- Fix: lowered the learning rate to 0.08 (~4x reduction) and added
+  best-epoch tracking (report/use the lowest-loss epoch seen across the
+  run, not whichever epoch happens to be last) — necessary because the
+  noisy per-condition-update trajectory meant the final epoch wasn't
+  reliably the best one (confirmed directly: in the first unstable run,
+  epoch 3's loss was roughly half of the final epoch 4's).
+- Result: converged to k1=0.6523, k2=0.9458. Evaluated against all 12
+  conditions: average Um error across the 9 trained conditions ~3.2% (down
+  from ~15.0% at w alone, and down from the ~20.2%/degenerate-collapse of
+  the earlier raw C_D-refit attempt), every trained condition under 10%
+  error, most under 5%, all 9 signs still correct — the k1/k2 fit didn't
+  undo w's sign fix. The one remaining outlier (WC=0.10@Um=0.75, 17.57%
+  error) is the already-understood, separately-flagged phase-collapse
+  condition, unaffected by any friction/drag closure by construction (see
+  "Current Limitation: Vanishing-Phase Singularity" under Known Issues).
+- Side note, held loosely (not a training target, so not to be
+  over-interpreted): WC=0.50@Um=0.50 — one of the two excluded
+  near-inversion conditions — also picked up the correct sign under the
+  fitted k1/k2, even though it was never part of the loss. Possibly
+  coincidental.
+- Physical interpretation: k1=0.65 (water's friction cut by ~35%) vs.
+  k2=0.95 (oil's barely changed) is a different story than "friction
+  magnitude was uniformly overpredicted" — it indicates the residual
+  magnitude error was concentrated specifically on WATER's friction, a
+  phase the S_i/w work never touched (w only ever modified oil's D_h2, via
+  the interfacial chord term). This is a coherent complement to, not a
+  duplicate of, the S_i/w fix: w corrected oil's distributional/geometric
+  friction, k1/k2 (mostly k1) corrects water's magnitude — a lever w never
+  had.
+- Not yet done: baking k1/k2 in as new defaults (planned, not yet applied);
+  re-running the zero-drag-ceiling sweep to check whether the conditions
+  found unreachable before are now reachable under this improved friction
+  closure, before deciding whether to resume the paused C_D refit.
 
 ---
 
@@ -622,7 +930,21 @@ instead of one, split by the sign of each condition's target slip
 (pre-/post-inversion), rather than a full NN-learned M1. This directly tests
 whether the single-scalar plateau (see Current Status, item 7) is a
 regime-dependence problem specifically, before paying the cost of the full
-Phase 2b effort.
+Phase 2b effort. **Superseded** — see the note on Current Status item 7.
+
+**Redirect**: a zero-drag-ceiling sweep (see "C_D refit surfaces a
+fundamental ceiling..." under Completed Phases) established that *any*
+drag closure of this damping-force form — dispersed bubble, stratified
+interfacial, or a full NN-learned M1 — collapses to the identical
+zero-drag simulation as its coefficient → 0, so the achievable slip range
+is set entirely by non-drag physics (wall friction) and is invariant to
+which drag closure is chosen. This means richer M1 formulations (Phase
+2b/2c as originally scoped) would not resolve the currently-unreachable
+conditions. Current priority has shifted to characterizing and correcting
+wall friction *magnitude* first (Current Status, item 9) — with the
+expectation that "the NN" (if still needed once a simple scalar correction
+is tested) would eventually target a wall-friction correction rather than
+M1.
 
 ### Why Learn C_D First (Not Full M1)
 
@@ -929,3 +1251,35 @@ Section 8:  plotting
 - Trallero JL (1995). "Oil-Water Flow Pattern in Horizontal Pipes."
   PhD Dissertation, University of Tulsa.
   → Most comprehensive raw oil-water holdup dataset. Target for Phase 2c.
+
+- Taitel Y, Dukler AE (1976). Original stratified flow model paper — assumed
+  a *constant* ratio between interfacial and wall friction factor, since
+  identified in follow-up literature as the model's primary weakness.
+  → Base geometry this project's wall friction closure is derived from; see
+  "Wall friction upgrade: Taitel-Dukler stratified geometry" under
+  Completed Phases.
+
+- Rodriguez OMH, Oliemans RVA (2006). Two-fluid model errors for stratified
+  oil-water flow: 20-40% average, exceeding 100% in some cases; improved to
+  ~35% by incorporating interfacial wave roughness.
+  → Found via literature search (2026-08-18) confirming this project's own
+  Um/slip error magnitudes are typical for this model class, not a bug.
+  See "C_D refit surfaces a fundamental ceiling..." under Completed Phases.
+
+- Chakrabarti DP et al. (2005). Pressure gradient predictions for stratified
+  flow vary 40-200% depending on closure relations chosen (adapting
+  Brauner et al. 1998).
+  → Same literature search as above.
+
+- Ng TS, Lawrence CJ, Hewitt GF (2004). Oil-water equivalent wall/interfacial
+  friction factors described as "quite inconsistent" and "difficult to
+  formulate."
+  → Same literature search as above.
+
+- "Prediction of pressure gradient and hold-up in horizontal liquid-liquid
+  pipe flow" (2023), Petroleum Science.
+  → Reached -7.06% mean error (20.72% std) by modifying friction
+  correlations for oil viscosity, interfacial curvature, and phase fraction
+  jointly, rather than a single flat multiplier — reference point for how
+  far a well-designed closure can go beyond a simple k1/k2 correction.
+  https://www.sciencedirect.com/science/article/pii/S1995822623001681

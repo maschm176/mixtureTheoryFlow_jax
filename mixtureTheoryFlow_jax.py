@@ -1801,56 +1801,66 @@ USAGE
        validation_wc_vs_Um.png
        validation_parity.png
 """
-###### Data Generation - Generating Synthetic Dataset for Training ###############
-# ══════════════════════════════════════════════════════════════════════════════
-# Section 7a — Synthetic dataset generation
-# ══════════════════════════════════════════════════════════════════════════════
 
-def generate_synthetic_dataset(drag_coeff_true, conditions,
-                                n_spinup, dt_fixed,
-                                dx, D, d_b, mu1, mu2,
-                                theta, N,
-                                rho1_val, rho2_val):
+# ══════════════════════════════════════════════════════════════════════════════
+# Section 7a (Phase 2a) — Load real Ibarra experimental data
+# ══════════════════════════════════════════════════════════════════════════════
+# Unlike Phase 1's synthetic dataset, there's no known true drag_coeff here --
+# slip_target is back-calculated algebraically from experimental WC, Um, psi.
+# spinup_drag_coeff below is just a placeholder used to reach a realistic
+# converged flow state before training -- bulk flow quantities (phi1,
+# velocity profile) are drag-insensitive, so any reasonable value works here.
+
+import os
+import pickle
+import pandas as pd
+
+ibarra_df = pd.read_csv('ibarra_phase2a_dataset.csv')
+ibarra_df = ibarra_df.dropna(subset=['psi']).reset_index(drop=True)
+print(f"Loaded {len(ibarra_df)} conditions with usable psi (back-calculable slip)")
+
+
+def generate_real_dataset(df, spinup_drag_coeff, n_spinup, dt_fixed,
+                           dx, D, d_b, mu1, mu2, theta, N,
+                           rho1_val, rho2_val):
     """
-    Run simulation at known drag_coeff_true for each condition.
-    Saves phi1_plateau, Um, u1_mean, u2_mean as training targets
-    and the converged spinup state for use during training.
+    Build a Phase 2a training dataset from real Ibarra conditions.
+
+    slip_target is back-calculated algebraically from WC, Um_target, psi --
+    no simulation involved in that part. spinup_drag_coeff only sets the
+    starting flow state for training, not the target.
     """
     dataset = []
 
-    for idx, cond in enumerate(conditions):
-        WC   = cond['WC']
-        dpdz = cond['dpdz']
-        Um_t = cond['Um_target']
+    for idx, row in df.iterrows():
+        WC, dpdz, Um_t, psi = row['WC'], row['dpdz_measured'], row['Um_target'], row['psi']
 
         p_out = 1.0000e5
         p_in  = p_out + dpdz * L
 
-        print(f"\n  [{idx+1}/{len(conditions)}] "
-            f"WC={WC:.1f}  dpdz={dpdz:.1f} Pa/m  "
-            f"Um_target={Um_t:.2f} m/s")
+        print(f"\n  [{idx+1}/{len(df)}] WC={WC:.3f}  dpdz={dpdz:.1f} Pa/m  "
+              f"Um_target={Um_t:.2f} m/s  psi={psi:.3f}")
 
-        # Initial state for this condition
+        # Back-calculate the true slip target from experimental data --
+        # pure algebra, no simulation needed for this part
+        u1_true     = (WC * Um_t) / psi
+        u2_true     = ((1.0 - WC) * Um_t) / (1.0 - psi)
+        slip_target = u2_true - u1_true
+
+        # Spin up to a realistic converged flow state using the placeholder drag
         dx_c, x_c = make_grid(L, N)
-        state_c = initial_conditions(
-            x_c, L, WC,
-            rho1_val, rho2_val,
-            p_in, p_out
-        )
+        state_c = initial_conditions(x_c, L, WC, rho1_val, rho2_val, p_in, p_out)
 
-        # Scan step with known true drag
         def make_scan_step(p_in_c, p_out_c, WC_c):
             def scan_step_c(state, dt):
                 new_state = time_step_learned(
-                    state, dt, dx_c, drag_coeff_true, D,
-                    p_in_c, p_out_c, d_b, mu1, mu2,
-                    theta, WC_c
+                    state, dt, dx_c, spinup_drag_coeff, D,
+                    p_in_c, p_out_c, d_b, mu1, mu2, theta, WC_c
                 )
                 return new_state, None
             return scan_step_c
 
         scan_fn = make_scan_step(p_in, p_out, WC)
-
         run_spinup_c = jax.jit(lambda s: jax.lax.scan(
             scan_fn, s, jnp.full(n_spinup, dt_fixed)
         )[0])
@@ -1861,217 +1871,153 @@ def generate_synthetic_dataset(drag_coeff_true, conditions,
         spinup = jax.lax.stop_gradient(spinup)
         print(f"    Spinup done in {time.time()-t0:.1f}s")
 
-        # Extract plateau quantities
-        i_start = N // 4
-        i_end   = 3 * N // 4
-
-        phi1_p = spinup['phi1'][i_start:i_end]
-        phi2_p = spinup['phi2'][i_start:i_end]
-        u1_p   = spinup['u1'][i_start:i_end]
-        u2_p   = spinup['u2'][i_start:i_end]
-
-        phi1_plateau = float(jnp.mean(phi1_p))
-        u1_mean      = float(jnp.mean(u1_p))
-        u2_mean      = float(jnp.mean(u2_p))
-        Um_sim       = float(jnp.mean(phi1_p * u1_p + phi2_p * u2_p))
-        slip_target  = float(jnp.mean(u2_p - u1_p))  # calculating slip velocity
-
-        print(f"    phi1={phi1_plateau:.4f}  "
-            f"u1={u1_mean:.4f} m/s  "
-            f"u2={u2_mean:.4f} m/s  "
-            f"Um={Um_sim:.4f} m/s")
+        u1_mean = float(jnp.mean(spinup['u1'][N//4:3*N//4]))
+        u2_mean = float(jnp.mean(spinup['u2'][N//4:3*N//4]))
+        print(f"    slip_target (back-calculated) = {slip_target:.4f} m/s   "
+              f"[spinup gives u1={u1_mean:.4f}  u2={u2_mean:.4f} -- sanity check only]")
 
         dataset.append({
-            'WC':           WC,
-            'dpdz':         dpdz,
-            'Um_target':    Um_t,
-            'p_inlet':      p_in,
-            'p_outlet':     p_out,
-            'phi1_inlet':   WC,
-            'phi1_target':  phi1_plateau,
-            'Um_sim':       Um_sim,
-            'u1_mean':      u1_mean,
-            'u2_mean':      u2_mean,
-            'slip_target':  slip_target,  
-            'spinup_state': spinup,
+            'WC': WC, 'dpdz': dpdz, 'Um_target': Um_t, 'psi': psi,
+            'p_inlet': p_in, 'p_outlet': p_out, 'phi1_inlet': WC,
+            'u1_mean': u1_mean, 'u2_mean': u2_mean,
+            'slip_target': slip_target, 'spinup_state': spinup,
         })
 
-    print(f"\nDataset complete: {len(dataset)} conditions generated.")
+    print(f"\nReal dataset complete: {len(dataset)} conditions generated.")
     return dataset
 
 
-# ── Training conditions ────────────────────────────────────────────────────────
-# 8 conditions: 4 WC values × 2 mixture velocities
-# Pressure gradients from Ibarra Figure 10
+# ── Generate dataset, or load it back if it already exists ─────────────────────
+# Same resume pattern as Phase 1's synthetic dataset -- safe to rerun this cell
+# repeatedly, it only regenerates if the file is missing. Delete
+# ibarra_real_dataset_full.pkl if you edit ibarra_phase2a_dataset.csv and want
+# to force regeneration.
+real_dataset_path = 'ibarra_real_dataset_full.pkl'
 
-conditions = [
-    {'WC': 0.2, 'dpdz': 100.0, 'Um_target': 0.50},
-    {'WC': 0.3, 'dpdz': 105.0, 'Um_target': 0.50},
-    {'WC': 0.7, 'dpdz': 106.0, 'Um_target': 0.50},
-    {'WC': 0.8, 'dpdz': 105.0, 'Um_target': 0.50},
-    {'WC': 0.2, 'dpdz': 220.0, 'Um_target': 0.75},
-    {'WC': 0.3, 'dpdz': 228.0, 'Um_target': 0.75},
-    {'WC': 0.7, 'dpdz': 228.0, 'Um_target': 0.75},
-    {'WC': 0.8, 'dpdz': 225.0, 'Um_target': 0.75},
-]
+if os.path.exists(real_dataset_path):
+    print(f"Loading existing real dataset from {real_dataset_path} ...")
+    with open(real_dataset_path, 'rb') as f:
+        real_dataset = pickle.load(f)
+    print(f"Loaded {len(real_dataset)} conditions from disk.")
+else:
+    print("=" * 60)
+    print("Generating real-data training set from Ibarra experimental conditions")
+    print("=" * 60)
 
-# Generate dataset
-print("=" * 60)
-print("Generating synthetic training dataset")
-print(f"  Known drag_coeff = {drag_coeff:.2e}  (network must recover this)")
-print("=" * 60)
+    real_dataset = generate_real_dataset(
+        ibarra_df,
+        spinup_drag_coeff = drag_coeff,   # placeholder only -- see note above
+        n_spinup          = n_spinup,
+        dt_fixed          = dt_fixed,
+        dx                = dx,
+        D                 = D,
+        d_b               = d_b,
+        mu1               = mu1,
+        mu2               = mu2,
+        theta             = theta,
+        N                 = N,
+        rho1_val          = rho1_val,
+        rho2_val          = rho2_val,
+    )
 
-dataset = generate_synthetic_dataset(
-    drag_coeff_true = drag_coeff,
-    conditions      = conditions,
-    n_spinup        = n_spinup,
-    dt_fixed        = dt_fixed,
-    dx              = dx,
-    D               = D,
-    d_b             = d_b,
-    mu1             = mu1,
-    mu2             = mu2,
-    theta           = theta,
-    N               = N,
-    rho1_val        = rho1_val,
-    rho2_val        = rho2_val,
-)
-
-# Save dataset metadata (without spinup states — too large)
-import pickle
-with open('synthetic_dataset_phase1.pkl', 'wb') as f:
-    pickle.dump([
-        {k: v for k, v in cond.items() if k != 'spinup_state'}
-        for cond in dataset
-    ], f)
-print("Dataset metadata saved to synthetic_dataset_phase1.pkl")
-
-###### adding slip to synthetic dataset after it's been created ######
-# Add slip_target to every condition in your existing dataset
-# u2_mean is oil velocity, u1_mean is water velocity
-# positive value means oil faster than water — correct for your case
-for cond in dataset:
-    cond['slip_target'] = cond['u2_mean'] - cond['u1_mean']
-
-###### ML Training Loop (Phase 1) — learn drag coefficient from slip velocity
+    with open(real_dataset_path, 'wb') as f:
+        pickle.dump(real_dataset, f)
+    print(f"Full real dataset (including spinup states) saved to {real_dataset_path}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 7b — Training loop
+# Section 7c (Phase 2a) — NN training loop on real experimental data
 # ══════════════════════════════════════════════════════════════════════════════
+# Reuses DragClosureNetwork / build_network_inputs / loss_fn unchanged from
+# Section 3 -- only the dataset changed (real_dataset instead of synthetic
+# dataset). No "true" drag_coeff exists for real data, so there's no ratio
+# to report -- only loss and slip_err are meaningful convergence signals here.
 
-# ── Hyperparameters ────────────────────────────────────────────────────────────
-n_window    = 1000    # differentiable window steps (0.1s at dt=1e-4)
-n_epochs    = 300
+n_window    = 1000
+n_epochs    = 30
 lr          = 1e-3
-print_every = 25
+print_every = 10
 
-# ── Initialize network and optimizer ──────────────────────────────────────────
+# ── Initialize network and optimizer, resuming from a checkpoint if one exists ──
+resume_path_nn = 'drag_network_realdata.eqx'
+opt_path_nn    = 'optimizer_state_realdata.pkl'
+
 key       = jax.random.PRNGKey(42)
 network   = DragClosureNetwork(key)
 optimizer = optax.adam(learning_rate=lr)
-opt_state = optimizer.init(eqx.filter(network, eqx.is_array))
+
+if os.path.exists(resume_path_nn) and os.path.exists(opt_path_nn):
+    network = eqx.tree_deserialise_leaves(resume_path_nn, network)
+    with open(opt_path_nn, 'rb') as f:
+        opt_state = pickle.load(f)
+    print(f"Resumed network from {resume_path_nn}")
+else:
+    opt_state = optimizer.init(eqx.filter(network, eqx.is_array))
+    print("No checkpoint found — starting fresh network")
+
+epoch_history_nn = []
+loss_history_nn  = []
 
 print(f"\n{'='*60}")
-print(f"Phase 1 Training — recover drag_coeff = {drag_coeff:.2e}")
-print(f"  Conditions:  {len(dataset)}")
+print(f"Phase 2a Training (NN, real data) — {len(real_dataset)} conditions")
 print(f"  Epochs:      {n_epochs}")
 print(f"  Window:      {n_window} steps ({n_window*dt_fixed:.2f}s)")
 print(f"  LR:          {lr}")
 print(f"{'='*60}\n")
 
-# ── Training ───────────────────────────────────────────────────────────────────
 for epoch in range(n_epochs):
+    epoch_loss, epoch_C_D, epoch_slip_err = 0.0, 0.0, 0.0
+    n = len(real_dataset)
 
-    # Reset accumulators at the start of each epoch
-    epoch_loss     = 0.0
-    epoch_C_D      = 0.0
-    epoch_slip_err = 0.0
-    n              = len(dataset)
-
-    # ── Inner loop: one pass through all training conditions ───────────────────
-    for cond in dataset:
-
-        # Compute loss and gradients
+    for cond in real_dataset:
         (loss_val, aux), grads = eqx.filter_value_and_grad(
             loss_fn, has_aux=True
-        )(
-            network, cond, n_window, dt_fixed,
-            dx, D, d_b, mu1, mu2, theta, N
-        )
+        )(network, cond, n_window, dt_fixed, dx, D, d_b, mu1, mu2, theta, N)
 
-        # Unpack 4 auxiliary values from loss_fn
         phi1_pred, Um_pred, slip_pred, C_D_pred = aux
 
-        # Update network weightss
         updates, opt_state = optimizer.update(
-            eqx.filter(grads,   eqx.is_array),
-            opt_state,
-            eqx.filter(network, eqx.is_array),
+            eqx.filter(grads, eqx.is_array), opt_state, eqx.filter(network, eqx.is_array)
         )
         network = eqx.apply_updates(network, updates)
 
-        # Accumulate metrics across all conditions this epoch
         epoch_loss     += float(loss_val)
         epoch_C_D      += float(C_D_pred)
         epoch_slip_err += abs(float(slip_pred) - cond['slip_target']) \
                           / (abs(cond['slip_target']) + 1e-6) * 100
 
-    # ── After inner loop: full epoch complete ──────────────────────────────────
-    # Everything below runs once per epoch, not once per condition
+    avg_loss, avg_C_D, avg_slip_err = epoch_loss/n, epoch_C_D/n, epoch_slip_err/n
 
-    # Compute epoch averages
-    avg_loss     = epoch_loss     / n
-    avg_C_D      = epoch_C_D      / n
-    avg_slip_err = epoch_slip_err / n
+    epoch_history_nn.append(epoch)
+    loss_history_nn.append(avg_loss)
 
-    # Print progress at regular intervals and on final epoch
     if epoch % print_every == 0 or epoch == n_epochs - 1:
-        print(f"Epoch {epoch:4d}  "
-              f"loss={avg_loss:.6f}  "
-              f"C_D={avg_C_D:.4e}  "
-              f"true={drag_coeff:.4e}  "
-              f"ratio={avg_C_D/drag_coeff:.3f}  "
-              f"slip_err={avg_slip_err:.2f}%")
+        print(f"Epoch {epoch:4d}  loss={avg_loss:.6f}  C_D_eff={avg_C_D:.4e}  slip_err={avg_slip_err:.2f}%")
 
-    # Save checkpoint every 50 epochs
     if epoch % 50 == 0:
-        eqx.tree_serialise_leaves(
-            f"checkpoint_epoch{epoch}.eqx", network
-        )
-        with open(f"checkpoint_opt_epoch{epoch}.pkl", "wb") as f:
+        eqx.tree_serialise_leaves(f"checkpoint_realdata_epoch{epoch}.eqx", network)
+        with open(f"checkpoint_realdata_opt_epoch{epoch}.pkl", "wb") as f:
             pickle.dump(opt_state, f)
 
-    # Check stop flag — only at epoch boundary so state is consistent
     if controller.stop:
         print(f"\nTraining stopped at epoch {epoch}.")
-        print(f"Saving final state...")
-        eqx.tree_serialise_leaves("drag_network_phase1.eqx", network)
-        with open("optimizer_state_phase1.pkl", "wb") as f:
+        eqx.tree_serialise_leaves(resume_path_nn, network)
+        with open(opt_path_nn, "wb") as f:
             pickle.dump(opt_state, f)
         print(f"Saved. Resume from epoch {epoch}.")
-        break   # exits the outer epoch loop only
+        break
 
-# ── Final evaluation ───────────────────────────────────────────────────────────
-# This block is OUTSIDE the training loop entirely
-# It runs exactly once after training completes (or is stopped)
+# ── Final evaluation ─────────────────────────────────────────────────────────
 print(f"\n{'='*60}")
-print(f"Final evaluation")
-print(f"Target C_D = {drag_coeff:.6e}")
+print(f"Final evaluation (Phase 2a, real data)")
 print(f"{'='*60}")
-
-# Header printed BEFORE data rows
-print(f"{'WC':>5}  {'Um':>5}  {'C_D_learned':>14}  "
-      f"{'ratio':>7}  {'slip_pred':>10}  {'slip_tgt':>10}  {'slip_err%':>9}")
+print(f"{'WC':>6}  {'Um':>5}  {'C_D_eff':>12}  {'slip_pred':>10}  {'slip_tgt':>10}  {'slip_err%':>9}")
 print("-" * 65)
 
-for cond in dataset:
+for cond in real_dataset:
     x = build_network_inputs(
-        jnp.array(cond['WC']),
-        jnp.array(cond['u1_mean']),
-        jnp.array(cond['u2_mean']),
+        jnp.array(cond['WC']), jnp.array(cond['u1_mean']), jnp.array(cond['u2_mean'])
     )
     C_D_final = float(network(x))
-    ratio     = C_D_final / drag_coeff
 
     (_, (phi1_pred, Um_pred, slip_pred, _)), _ = eqx.filter_value_and_grad(
         loss_fn, has_aux=True
@@ -2080,14 +2026,11 @@ for cond in dataset:
     slip_err = abs(float(slip_pred) - cond['slip_target']) \
                / (abs(cond['slip_target']) + 1e-6) * 100
 
-    print(f"{cond['WC']:>5.1f}  "
-          f"{cond['Um_target']:>5.2f}  "
-          f"{C_D_final:>14.6e}  "
-          f"{ratio:>7.3f}  "
-          f"{float(slip_pred):>10.6f}  "
-          f"{cond['slip_target']:>10.6f}  "
-          f"{slip_err:>7.2f}%")
+    print(f"{cond['WC']:>6.3f}  {cond['Um_target']:>5.2f}  {C_D_final:>12.6e}  "
+          f"{float(slip_pred):>10.6f}  {cond['slip_target']:>10.6f}  {slip_err:>7.2f}%")
 
 # Save final network
-eqx.tree_serialise_leaves("drag_network_phase1.eqx", network)
-print(f"\nTrained network saved to drag_network_phase1.eqx")
+eqx.tree_serialise_leaves(resume_path_nn, network)
+with open(opt_path_nn, 'wb') as f:
+    pickle.dump(opt_state, f)
+print(f"\nTrained network saved to {resume_path_nn}")
