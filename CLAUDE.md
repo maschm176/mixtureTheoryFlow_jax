@@ -22,6 +22,30 @@
 
 ## Current Status
 
+**MAJOR UPDATE (2026-09-02): a project-wide mu1/mu2 (water/oil viscosity) swap
+bug was found and fixed, invalidating the specific numeric values quoted
+below (w=0.4920, k1=0.6523, k2=0.9458) and in most of "Completed Phases."**
+`mu1` was assigned oil's true viscosity and `mu2` water's — backwards
+relative to `advance_momentum`'s convention (`mu1`=phase 1=water,
+`mu2`=phase 2=oil) — in every live Ibarra/Angeli parameter block from the
+project's earliest real-data commit through the k1/k2 holdout test and the
+first Angeli cross-validation. See "Discovered and fixed a project-wide
+mu1/mu2 viscosity swap bug" under Completed Phases for the full
+investigation and git-archaeology evidence. Everything downstream has since
+been refit and revalidated under corrected physics — see the newer
+Completed Phases entries below (w/k1/k2 refit, zero-drag-ceiling recheck,
+Russell out-of-sample validation, Angeli out-of-sample validation) for
+current, trustworthy numbers. The qualitative conclusions of most earlier
+work (Taitel-Dukler over Blasius, the S_i/w interfacial fix, k1/k2 as
+phase-specific magnitude corrections) still hold — only the specific fitted
+values and error percentages needed updating. **Current best fit (Ibarra,
+corrected viscosity): w=1.0, k1=1.1102, k2=0.5853.**
+
+The numbered "Next steps" list immediately below predates this fix and is
+kept as historical record of the swapped-viscosity-era investigation, not
+as the current plan — see "Current active step" at the end of this section
+for where things actually stand now.
+
 Phase 1 (scalar C_D optimization) is validated. The wall friction closure has
 been swapped from per-phase Blasius (D_h_i = D*phi_i) to Taitel-Dukler
 stratified segment geometry, after the Blasius version was found to badly
@@ -168,6 +192,29 @@ sign-crossing-location problem, and w has been fit against real data
     conditions are now reachable, before (3) deciding whether to resume the
     paused C_D refit (item 8) now that its binding ceiling has likely
     moved. Not yet done.
+    **Superseded by the viscosity-swap fix**: item (1) never happened as
+    described (baking in 0.6523/0.9458) — those values themselves turned
+    out to be fit under the swapped-viscosity bug. Item (2) (the ceiling
+    recheck) has now been done properly, under corrected viscosity AND the
+    fresh w/k1/k2 refit — see "Zero-drag-ceiling sweep rechecked under
+    corrected physics" under Completed Phases. Result: only 4/11 trained
+    Ibarra conditions remain structurally unreachable (down from most).
+
+**Current active step (as of 2026-09-02)**: with the viscosity bug fixed,
+w/k1/k2 refit, and the ceiling recheck showing 7/11 Ibarra conditions now
+have real headroom for drag to matter, the natural next move is to resume
+the paused C_D refit (item 8) for those 7 reachable conditions. A parallel,
+independent question — whether to proceed straight to learning the full
+interaction term (M1) instead of refitting scalar C_D — was explicitly
+deferred until the ceiling recheck was done, precisely because a full
+NN-learned M1 would hit the identical structural ceiling for the identical
+reason (see "Redirect" note under Neural Network: Drag Closure Learning).
+Not yet decided which of these two to do first. Also concluded: NOT worth
+calibrating C_D or refitting k1/k2 specifically on Russell data (see
+"Out-of-sample validation on Russell" under Completed Phases) — only 3/17
+Russell conditions have a genuinely usable window, too few to constrain 2-3
+free parameters, and Russell is more valuable as an independent
+out-of-sample check than as a fitting target.
 
 ---
 
@@ -649,6 +696,198 @@ data — closes most of the residual Um gap**
   re-running the zero-drag-ceiling sweep to check whether the conditions
   found unreachable before are now reachable under this improved friction
   closure, before deciding whether to resume the paused C_D refit.
+- **Superseded**: k1=0.6523/k2=0.9458 turned out to be fit under the
+  swapped-viscosity bug (see "Discovered and fixed a project-wide mu1/mu2
+  viscosity swap bug" below) — refit under corrected physics to
+  k1=1.1102/k2=0.5853. See "w/k1/k2 refit under corrected viscosities
+  (Ibarra)" below for the current numbers.
+
+**Discovered and fixed a project-wide mu1/mu2 (water/oil viscosity) swap bug
+spanning nearly the entire project's history**
+- Trigger: investigating why a zero-refit forward run against Russell,
+  Hodgson & Govier (1959) data landed on the *opposite* flow regime from
+  the one hand-verified against the real data (water genuinely turbulent
+  given its low viscosity, oil genuinely laminar at 18 cp — the simulation
+  instead put water on the laminar branch and oil on turbulent, for every
+  one of 17 conditions). Ruled out, in order, by direct instrumentation
+  rather than guessing: the pressure-projection step (`pressure_poisson_
+  solve`/`project_velocities` contribute ~2 orders of magnitude less
+  acceleration than the explicit force terms at a real, properly-developed
+  state), drag (already known negligible), gravity (exactly zero, horizontal
+  pipe), and the non-conservative pressure term (near-zero in a
+  composition-uniform plateau). A full term-by-term breakdown of
+  `advance_momentum` showed friction correctly signed and substantial — the
+  only place left to look was the Reynolds-number/viscosity machinery
+  itself.
+- Root cause: `mu1` (which `advance_momentum` always pairs with phase 1 =
+  water, e.g. `visc1 = phi1_int*mu1*...`, `Re1 = rho1*u1*D_h1/mu1`) was
+  being assigned **oil's** true viscosity, and `mu2` (paired with phase 2 =
+  oil) was being assigned **water's**. The variable-to-phase mapping was
+  backwards in the one live (non-commented) parameter block in the mega
+  source cell — comments correctly identified which number belonged to
+  which real fluid, but assigned them to the wrong variables.
+- Numeric consequence, worked out by hand: `Re1 = rho1*u1*D_h1/mu1` using
+  oil's much larger viscosity in the denominator suppressed water's
+  computed Re by the same large factor, keeping it artificially laminar;
+  `Re2` using water's much smaller viscosity inflated oil's computed Re by
+  the same factor, keeping it artificially turbulent — a self-consistent,
+  exactly-backwards regime for every condition, not a subtle numerical
+  artifact.
+- Scope, established via git archaeology (`git show <commit>:notebook`,
+  not assumption): the exact same backwards assignment was present in
+  *every* live Ibarra or Angeli parameter configuration from commit
+  `6ebcde88` (2026-06-11 — the original Figure 10 momentum validation,
+  predating even Phase 1) through `a2d1cc10` (2026-08-21 — the k1/k2
+  holdout test) and again in the first Angeli & Hewitt cross-validation
+  commit `b881ff7c` (2026-08-26). At the earliest commit the *comments*
+  were also backwards (calling 5.4e-3 "water"); from commit `513eb133`
+  onward the comments were corrected to identify the right real-world
+  fluid, but the variable assignment itself was never fixed to match, so
+  the bug persisted with correct-looking comments masking it.
+- What this does and doesn't invalidate: **not** Phase 1's synthetic scalar
+  C_D optimization — its synthetic targets were generated by the same
+  (consistently swapped) physics used to fit against them, a
+  self-consistent test of the optimization machinery, not of real-data
+  accuracy, so its core conclusions (gradient chain works end-to-end, slip
+  is only weakly sensitive to drag_coeff) likely still hold. **Does**
+  invalidate the numeric results of essentially every real-data-comparison
+  "Completed Phase": the original Figure 10 validation (~7.2% MAE, +1.5%
+  bias), the wall-friction/phase-inversion investigation's specific
+  findings, the S_i/w interfacial fit (w=0.4920), and the k1/k2 magnitude
+  fit (k1=0.6523, k2=0.9458). The qualitative reasoning behind each of
+  those (Taitel-Dukler's geometry advantage over Blasius, S_i/w fixing a
+  zero-crossing-location problem, k1/k2 as phase-specific magnitude
+  corrections) is not undermined by this bug and did not need to be
+  redone from scratch — only the specific fitted values did.
+- Fix: corrected the mu1=water/mu2=oil assignment for the Ibarra, Angeli,
+  and Russell parameter blocks. Re-ran the same Russell regime check after
+  the fix: `turb/lam` (water turbulent, oil laminar — the physically
+  correct regime) in all 17 conditions, no exceptions.
+
+**w/k1/k2 refit under corrected viscosities (Ibarra)**
+- Same fitting procedure as the original (pre-bug) fit — central
+  finite-difference gradients, `w` sigmoid-bounded to (0,1), `k1`/`k2` in
+  log-space, full N_TOTAL_STEPS=370,000-step forward-only passes — rerun
+  from scratch under corrected `mu1`/`mu2`.
+- Converged to **w=1.0** (pinned at the upper bound its sigmoid
+  parameterization allows — the optimizer wanted to push further than the
+  bounded range permits, a signal the interfacial correction may be maxed
+  out for at least one condition, see the ceiling-recheck entry below),
+  **k1=1.1102**, **k2=0.5853**.
+- Evaluated against all 31 Ibarra conditions: mean |Um_err%| = 8.10%,
+  median = 7.65%, max = 24.32% (three WC=0.1 conditions phase-collapsed,
+  same exclusion policy as always). A large, clean improvement over the
+  swapped-viscosity-era fit.
+- Error tracks water cut, not flow regime — grouping by WC: best at WC=0.9
+  (~2.8% mean, oil a small laminar minority there), worst at WC=0.6 (~11.8%
+  mean, includes the single worst outlier). Every condition shows the
+  correct `turb/lam` regime (water turbulent, oil laminar) — confirms the
+  regime fix generalizes across the whole dataset, not just isolated
+  points, and that residual error is a magnitude question, not a
+  regime-classification one.
+- Noted, not confirmed: the Blasius/laminar friction-factor switch has a
+  genuine ~53% jump discontinuity in `f_D` right at Re=2100 (turbulent side
+  ≈0.0467, laminar side ≈0.0305). The single worst outlier (WC=0.6@Um=1.25,
+  -24.32%) has Re2=2117.3 — just barely on the turbulent side of that exact
+  boundary. Plausible contributing factor for that one point; not verified
+  by directly testing the other side of the switch.
+
+**Zero-drag-ceiling sweep rechecked under corrected physics**
+- Rerun of the original "C_D refit surfaces a fundamental ceiling"
+  diagnostic (see that entry above), which had been done entirely under
+  the swapped-viscosity bug. Same method: sweep `slip_pred` vs. `C_D`
+  (1e-6 to 1e2) per condition, using each condition's own cached spinup
+  state, and read off the maximum achievable |slip| at `C_D→0`.
+- Result: only **4 of 11** trained Ibarra conditions remain structurally
+  unreachable by any non-negative-coefficient drag closure — down from
+  "most" of the conditions under the old (swapped) physics. Three are a
+  pure magnitude shortfall (target larger than the C_D=0 ceiling even with
+  drag entirely absent): WC=0.200/0.300/0.400@Um=0.75 (targets
+  0.2464/0.2079/0.1784, ceilings 0.1691/0.1036/-0.0294 — see next point for
+  the last one). WC=0.400@Um=0.50 (target=-0.0608, ceiling=-0.0262) is the
+  exact condition already excluded from the original `w` fit as one of the
+  two smallest-magnitude, hardest near-inversion targets in the dataset —
+  a consistency check, not a new problem.
+- WC=0.400@Um=0.75 is qualitatively different from the other three: its
+  ceiling (-0.0294) has the **wrong sign** relative to its target (+0.1784)
+  — meaning even zero drag produces the wrong direction of slip for this
+  condition, something no `C_D≥0` can ever fix regardless of magnitude.
+  Points at the simulated zero-crossing location still being off for this
+  specific condition even after the `w`/S_i refit — consistent with `w`
+  landing pinned at its upper bound (see previous entry).
+- Practical implication: 7 of 11 trained Ibarra conditions now have real
+  headroom for a drag closure to matter, versus almost none before —
+  substantially de-risks both resuming the paused scalar C_D refit and,
+  eventually, learning a richer interaction term (M1), since either would
+  have hit the old, much larger ceiling for the identical structural
+  reason.
+
+**Out-of-sample validation on Russell, Hodgson & Govier (1959) — Ibarra-fitted
+w/k1/k2, zero refitting, under corrected physics**
+- All 17 usable conditions now show the physically correct `turb/lam`
+  regime (water turbulent, oil laminar) — a complete reversal from the
+  swapped-viscosity-era finding of the opposite regime in every condition.
+- Um mean |err%| = 22.68% (down from 33.22% under the old, still-swapped
+  check), psi (holdup) mean |err%| = 19.49% (down from 43.77%), psi mean
+  |abs diff| = 0.089 (down from 0.178, roughly half).
+- Collapse count stayed at 11/17 both before and after this specific
+  refit, but the *set* shifted: WC=0.2398/0.1969 improved (no longer
+  collapse), WC=0.578/0.5236 newly collapse. Informative: argues against
+  friction-magnitude refitting broadly reducing Russell's collapse rate —
+  it moved the problem rather than shrinking it, consistent with collapse
+  being a structural property of the two-fluid formulation's velocity-
+  recovery step (see "Current Limitation: Vanishing-Phase Singularity"
+  under Known Issues), invariant to closure choice.
+- Built a full-duration (37s, chunked) oscillation/collapse sweep for
+  Russell, adapting the Ibarra Phase 2a methodology (new notebook cells
+  `p2b2-russell-osc-*`, `p2b2-russell-quiet-window-*`,
+  `p2b2-russell-build-dataset-*`; also added optional `w`/`k1`/`k2`
+  passthrough params to `generate_real_dataset` so it can target either
+  dataset without relying on `time_step_learned`'s possibly-stale
+  defaults). Result: only **3 of 17** Russell conditions (WC=0.1969,
+  0.1805, 0.7874) have a genuinely quiet+developed+uncollapsed window. For
+  most of the other 14, the collapsed phase is collapsed for 88-92% of the
+  *entire* run, not just briefly — a fuller, more decisive picture than
+  the single-final-state check alone suggested. Two conditions
+  (WC=0.6623, 0.578) show a distinct failure mode: `Um_sim` essentially
+  never stabilizes across the full run, independent of collapse.
+- Decision: NOT worth a Russell-specific `k1`/`k2` refit — only 3 usable
+  conditions is too few to reliably constrain 2 free parameters, and those
+  3 cluster at the WC extremes (0.18-0.20 and 0.79) rather than covering
+  the moderate-WC range where most of the error and collapse behavior
+  actually concentrates. Russell is more valuable kept as an independent
+  out-of-sample check than spent as a (statistically weak) fitting target.
+
+**Out-of-sample validation on Angeli & Hewitt (1998) — Ibarra-fitted w/k1/k2,
+zero refitting, under corrected physics**
+- Acrylic-only (same pipe material as Ibarra), comparable-Um-range subset,
+  stride=2 smoke test (11/21 conditions): mean |Um_err%| = 20.59%, median =
+  16.94%, max = 34.87%, zero NaN, zero collapse across all 11.
+- Error is systematic, not random: every single condition over-predicts Um
+  (all 11 errors positive). A one-directional bias like this is much more
+  tractable than scattered error — it's exactly the kind of thing a
+  magnitude correction (a dedicated Angeli `k1`/`k2` refit) reliably
+  cleans up, the same way it took Ibarra's own error from ~15% to ~3.2%.
+- Comparable in magnitude to Russell's zero-refit Um error (22.68%)
+  despite extrapolating in the *opposite* direction: Angeli's oil (1.6 cp)
+  is less viscous than Ibarra's (5.4 cp), while Russell's (18 cp) is more.
+  Getting similar-magnitude degradation in both directions is a reassuring
+  symmetry check on how the closure generalizes with distance from
+  Ibarra's own fluid pair.
+- Hypothesis, not yet tested: `k2=0.5853` was fit as a proportional cut to
+  oil's friction relative to Ibarra's 5.4 cp oil; applying the same
+  proportional cut to Angeli's already much-less-resistant 1.6 cp oil may
+  leave oil's total friction too low specifically for Angeli, consistent
+  with the observed one-directional over-prediction.
+- While reviewing the existing `p2b-angeli-eval-01` cell for this check,
+  found and fixed two bugs: a variable-name typo
+  (`angeli_comparab-le_acrylic`, a stray hyphen that raises a
+  `SyntaxError`) and the same w/k1/k2-not-passed-explicitly ambiguity
+  found elsewhere (relied on `time_step_learned`'s possibly-stale
+  defaults instead of passing them in).
+- Not yet done: the full comparable-Um acrylic set (stride=1, 21
+  conditions) — only the 11-condition smoke-test subset has been
+  evaluated so far.
 
 ---
 
@@ -661,7 +900,10 @@ analytical interphase drag closure with a physics-informed neural network (PINN)
 The work sits at the intersection of:
 - Computational fluid mechanics (two-fluid model, finite volume method)
 - Scientific machine learning (physics-informed neural networks)
-- Experimental validation (Ibarra et al. 2015 oil-water pipe flow data)
+- Experimental validation (Ibarra et al. 2015 as the primary fitting
+  dataset; Russell, Hodgson & Govier 1959 and Angeli & Hewitt 1998 as
+  independent, zero-refit out-of-sample checks against different fluid
+  pairs and pipe geometries — see References)
 
 ---
 
@@ -759,6 +1001,14 @@ d_b        = 1e-3    # bubble/particle diameter [m]
 
 **Important**: mu1 = water (0.9e-3), mu2 = oil (5.4e-3).
 Phase 1 = water (denser, bottom), Phase 2 = oil (lighter, top).
+
+**History**: this table's numbers were always correct in isolation, but the
+*live code* had `mu1`/`mu2` assigned backwards (oil's value into `mu1`,
+water's into `mu2`) for nearly the entire project's history, from the
+original Figure 10 validation through the k1/k2 fit and the first Angeli
+cross-validation — see "Discovered and fixed a project-wide mu1/mu2
+viscosity swap bug" under Completed Phases. Fixed as of 2026-09-02;
+`w`/`k1`/`k2` have been refit under the correction.
 
 ---
 
@@ -945,6 +1195,17 @@ wall friction *magnitude* first (Current Status, item 9) — with the
 expectation that "the NN" (if still needed once a simple scalar correction
 is tested) would eventually target a wall-friction correction rather than
 M1.
+
+**Update (2026-09-02)**: the ceiling sweep was rechecked under corrected
+viscosity and the fresh w/k1/k2 refit — see "Zero-drag-ceiling sweep
+rechecked under corrected physics" under Completed Phases. The ceiling has
+moved substantially: only 4/11 trained Ibarra conditions remain
+structurally unreachable, down from most. This means a richer M1 (Phase
+2b) is no longer blocked the way it was — the same recheck logic applies
+to it as to scalar C_D, so before committing to full Phase 2b it's worth
+confirming which of the two (resume scalar C_D refit, or go straight to
+learning M1) makes more sense now that the ceiling is far less binding.
+Not yet decided — see "Current active step" under Current Status.
 
 ### Why Learn C_D First (Not Full M1)
 
@@ -1180,8 +1441,14 @@ sign reversal caused phi1 to decrease (wrong direction). Current sign is correct
 Phase 1 = water (rho1=998, mu1=0.9e-3)
 Phase 2 = oil   (rho2=825, mu2=5.4e-3)
 
-Note: mu1 and mu2 labels were swapped in earlier code versions. Current
-values are correct — verify before any new simulation runs.
+Note: mu1 and mu2 were swapped in the live code for nearly the entire
+project's history (from the original Figure 10 validation through the
+first Angeli cross-validation, 2026-06-11 through 2026-08-26) — not just
+"earlier code versions" in a minor sense. See "Discovered and fixed a
+project-wide mu1/mu2 viscosity swap bug" under Completed Phases for the
+full scope and fix. Current values are correct as of 2026-09-02 — still
+worth verifying before any new simulation run, given how long this went
+unnoticed the first time.
 
 ---
 
@@ -1283,3 +1550,26 @@ Section 8:  plotting
   jointly, rather than a single flat multiplier — reference point for how
   far a well-designed closure can go beyond a simple k1/k2 correction.
   https://www.sciencedirect.com/science/article/pii/S1995822623001681
+
+- Russell TWF, Hodgson GW, Govier GW (1959). "Horizontal pipeline flow of
+  mixtures of oil and water." Canadian Journal of Chemical Engineering,
+  February 1959.
+  → Second out-of-sample validation dataset. 1-inch transparent cellulose
+  acetate butyrate pipe, white mineral oil (18.0 cp, SG 0.834) and water
+  (0.894 cp) at 77°F, 28.18 ft test section. Provides both pressure-drop
+  and in-situ holdup measurements (via quick-closing valves), unlike
+  Angeli & Hewitt below. Used zero-refit (no dataset-specific tuning) to
+  test whether Ibarra-fitted w/k1/k2 generalize to a much more viscous oil
+  (18 cp vs. Ibarra's 5.4 cp) — see "Out-of-sample validation on Russell"
+  under Completed Phases.
+
+- Angeli P, Hewitt GF (1998). Pressure gradient data for horizontal
+  oil-water flow, stainless steel and acrylic pipes.
+  → Third validation dataset — same fluids (oil 801 kg/m³, 1.6 cp; water
+  998 kg/m³, 1.0 cp) run through two different pipe materials/diameters
+  (stainless steel 24.3mm, roughness 7e-5m; acrylic 24.0mm, roughness
+  1e-5m — note this project's friction closure has no roughness term, so
+  only acrylic is treated as directly comparable to Ibarra's setup).
+  Angeli's oil (1.6 cp) is less viscous than Ibarra's (5.4 cp) — the
+  opposite direction of extrapolation from Russell's more-viscous oil. See
+  "Out-of-sample validation on Angeli & Hewitt" under Completed Phases.
