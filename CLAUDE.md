@@ -196,20 +196,28 @@ sign-crossing-location problem, and w has been fit against real data
     described (baking in 0.6523/0.9458) — those values themselves turned
     out to be fit under the swapped-viscosity bug. Item (2) (the ceiling
     recheck) has now been done properly, under corrected viscosity AND the
-    fresh w/k1/k2 refit — see "Zero-drag-ceiling sweep rechecked under
-    corrected physics" under Completed Phases. Result: only 4/11 trained
-    Ibarra conditions remain structurally unreachable (down from most).
+    fresh w/k1/k2 refit.
+    **Correction (2026-09-03)**: the "4/11 unreachable" figure just above
+    was itself wrong — it was computed from a stale cached
+    `ibarra_real_dataset_full.pkl` (last written 2026-08-19, predating the
+    viscosity fix by two weeks) whose spinup states still reflected the old
+    swapped physics. See "Phase 2a real-data scalar C_D refit completed"
+    below for the corrected number (5/11 unreachable) and the full
+    resolution.
 
-**Current active step (as of 2026-09-02)**: with the viscosity bug fixed,
-w/k1/k2 refit, and the ceiling recheck showing 7/11 Ibarra conditions now
-have real headroom for drag to matter, the natural next move is to resume
-the paused C_D refit (item 8) for those 7 reachable conditions. A parallel,
-independent question — whether to proceed straight to learning the full
-interaction term (M1) instead of refitting scalar C_D — was explicitly
-deferred until the ceiling recheck was done, precisely because a full
-NN-learned M1 would hit the identical structural ceiling for the identical
-reason (see "Redirect" note under Neural Network: Drag Closure Learning).
-Not yet decided which of these two to do first. Also concluded: NOT worth
+**PHASE 2a COMPLETE (2026-09-03)**: the scalar `C_D` refit against real
+Ibarra data (Current Status item 8, previously paused on the zero-drag
+ceiling) is done — see "Phase 2a real-data scalar C_D refit completed"
+under Completed Phases for the fitted value, the final reachable-condition
+set, and the out-of-sample Russell check. **Current active step**: (1)
+convert the model's/network's input features to dimensionless groups (Re,
+We, phi ratios) instead of the current ad-hoc dimensional scaling — already
+flagged as the intended Phase 2 direction under Network Architecture, and
+now more clearly motivated by the Russell out-of-sample check showing the
+scalar `C_D` fit doesn't transfer across viscosity ranges; (2) proceed to
+Phase 2b — learn the full interaction term M1 via a NN, structured (via
+those dimensionless inputs) with the explicit goal of generalizing across
+fluid pairs in a way the single scalar could not. Also concluded: NOT worth
 calibrating C_D or refitting k1/k2 specifically on Russell data (see
 "Out-of-sample validation on Russell" under Completed Phases) — only 3/17
 Russell conditions have a genuinely usable window, too few to constrain 2-3
@@ -889,6 +897,83 @@ zero refitting, under corrected physics**
   conditions) — only the 11-condition smoke-test subset has been
   evaluated so far.
 
+**Phase 2a real-data scalar C_D refit completed**
+- Trigger: resuming the C_D refit paused since "C_D refit surfaces a
+  fundamental ceiling," now that the ceiling had moved substantially under
+  corrected viscosity and the refit `w`/`k1`/`k2`.
+- Discovered and fixed a stale-cache bug before the ceiling number could be
+  trusted: `ibarra_real_dataset_full.pkl` was last written 2026-08-19 (the
+  same day as the original, swapped-viscosity-era k1/k2 fit) — `generate_
+  real_dataset` only regenerates when its output file is missing, so every
+  cached `spinup_state` in `real_dataset` still reflected the old backwards
+  physics regardless of what the current globals said. Confirmed via file
+  timestamp, not assumption. Fixed by deleting the stale pickle and
+  regenerating fresh, passing `w`/`k1`/`k2` explicitly (added as optional
+  params to `generate_real_dataset` for this purpose) rather than relying
+  on `time_step_learned`'s defaults.
+- Corrected zero-drag-ceiling result, from the freshly-regenerated dataset:
+  **5 of 11** conditions unreachable (not the earlier, stale-cache-derived
+  "4/11"): WC=0.400@Um=0.50 (ceiling sign-mismatched — same structural
+  issue as a magnitude shortfall, just worse, since no `C_D≥0` can ever
+  flip a sign), and WC=0.300/0.400/0.600/0.700@Um=0.75 (magnitude
+  shortfalls). Error concentrates differently by velocity than before:
+  at Um=0.50 only WC=0.400 fails now (WC=0.500, previously one of the two
+  hardest near-inversion conditions, is comfortably reachable under
+  corrected physics); at Um=0.75 the *middle* WC range fails while the
+  extremes (0.200, 0.800) pass.
+- Training set assembled from the 6 cleanly-reachable conditions plus
+  WC=0.700@Um=0.75, included despite being flagged unreachable since it's
+  a genuine near-miss (same sign, ceiling only ~6% short of target) rather
+  than a structural impossibility — 7 conditions total.
+- Discovered a second, distinct exclusion criterion mid-training:
+  WC=0.500@Um=0.50 (target slip = -0.0148 m/s, by far the smallest-
+  magnitude target among the 7) showed a 318% relative error at epoch 0
+  even though its *absolute* miss was smaller than several well-fitting
+  conditions — the normalized-relative-error loss
+  (`((pred-target)/|target|)²`) explodes for near-zero targets regardless
+  of fit quality. Confirmed this wasn't cosmetic: over subsequent epochs
+  `C_D` ran away from 4e-4 toward ~0.39, and every *other* condition's
+  error ballooned toward the degenerate "predict slip≈0 everywhere"
+  collapse already documented under "C_D refit surfaces a fundamental
+  ceiling" — the near-zero-target condition's inflated squared-relative-
+  error was dominating the aggregate gradient. Same underlying reason
+  WC=0.400/0.500@Um=0.50 were excluded from the original `w` fit,
+  rediscovered here independently for the C_D refit specifically. Excluded
+  WC=0.500@Um=0.50, leaving 6 final training conditions.
+- Result: converged cleanly to **C_D = 4.949e-3**. Final evaluation: mean
+  slip_err = 8.68%, std = 5.85%, ranging from 1.58% (WC=0.800@Um=0.75) to
+  17.94% (WC=0.700@Um=0.75, the included near-miss — its residual error is
+  expected, since its target was never fully within reach). The fit found
+  a genuine, stable compromise across independently-measured conditions
+  rather than driving error toward zero everywhere — evidence against
+  overfitting in the classical sense (1 free parameter, 6 data points, and
+  the residual pattern is structured, not uniformly near-zero).
+- Out-of-sample check against Russell's 3 reliable conditions (same
+  zero-refit methodology as the `w`/`k1`/`k2` checks): `Um`/`psi` matched
+  the already-validated Russell numbers exactly (confirms no setup bug —
+  first attempt at this check used stale Ibarra globals by mistake,
+  caught via a suspicious ~2x inflation in `Um_sim` and fixed by
+  re-running `reset-globals-russell-01`). Slip itself, however, showed a
+  real, substantial generalization gap: `slip_sim` at the fitted `C_D`
+  overshot Russell's (much smaller) targets by 225-1096% relative error —
+  large in *absolute* terms too, not just a near-zero-target artifact.
+  Notably, the direction is still informative: increasing `C_D` from the
+  1e-4 placeholder toward the fitted 4.949e-3 moved `slip_sim` toward the
+  target in all three conditions, and the sign was correct throughout —
+  just not enough magnitude change to close the gap. Interpreted as
+  genuine evidence that a single scalar `C_D` tuned on Ibarra's lighter
+  oil (5.4 cp) and lower velocities (Um=0.50-0.75) doesn't transfer to
+  Russell's much more viscous oil (18 cp) and higher velocities
+  (Um=0.69-1.21) — not a bug, and a concrete answer to whether the 6-point
+  fit generalizes: only partially, in the right direction but not the
+  right magnitude, outside the regime it was fit on.
+- Decision: do NOT chase a Russell-specific `C_D` (same reasoning as
+  `w`/`k1`/`k2` — too few usable Russell conditions to fit robustly).
+  Instead, treat this generalization gap as motivation for Phase 2b:
+  moving from a single scalar to a richer, dimensionless-input-based
+  interaction term (Re, We, phi ratios) with the explicit goal of holding
+  up across viscosity ranges the way this scalar fit did not.
+
 ---
 
 ## Project Overview
@@ -1156,15 +1241,27 @@ Phase 1:   synthetic data    → learn C_D scalar    → loss: slip velocity
            goal: verify gradient chain works end-to-end
            success: network recovers drag_coeff = 1e-4 from slip observations
 
-Phase 2a:  Ibarra data       → learn C_D scalar    → loss: slip (back-calculated)
+Phase 2a:  Ibarra data       → learn C_D scalar    → loss: slip (back-calculated)  [COMPLETE 2026-09-03]
            back-calculate slip from Um, WC, psi:
            u1 = (WC * Um) / psi
            u2 = ((1-WC) * Um) / (1-psi)
            slip = u2 - u1
+           result: C_D=4.949e-3, mean slip_err=8.68% on 6 reachable conditions.
+           Out-of-sample check against Russell showed the fit's *direction*
+           generalizes (correct sign, moves the right way) but not its
+           *magnitude* -- Russell's much more viscous oil (18 cp vs.
+           Ibarra's 5.4 cp) needs stronger drag than this scalar provides.
+           See "Phase 2a real-data scalar C_D refit completed" under
+           Completed Phases.
 
-Phase 2b:  Ibarra data       → learn full M1       → loss: phi1 + u1
+Phase 2b:  Ibarra data       → learn full M1       → loss: phi1 + u1  [CURRENT NEXT STEP]
            ~24 data points, proof-of-concept only
            requires stratified drag formulation (current dispersed bubble wrong)
+           Motivated directly by Phase 2a's generalization gap: switch
+           input features to dimensionless groups (Re, We, phi ratios --
+           see Network Architecture below) instead of scalar C_D's
+           regime-specific magnitude, with the explicit goal of holding up
+           across viscosity ranges the way the scalar didn't.
 
 Phase 2c:  larger dataset    → learn full M1       → loss: phi1 + u1
            Arirachakaran, Lovick-Angeli, Elseth, etc.
@@ -1240,6 +1337,15 @@ def build_network_inputs(phi1, u1, u2):
 ```
 
 Phase 2 will switch to dimensionless inputs (Re, We, phi ratios).
+
+**Motivation sharpened (2026-09-03)**: Phase 2a's completed scalar `C_D`
+fit generalized to Russell in *direction* only, not magnitude -- correct
+sign and the right qualitative response to increasing `C_D`, but nowhere
+near enough drag strength for Russell's much more viscous oil (18 cp vs.
+Ibarra's 5.4 cp). A dimensional scalar tuned on one fluid pair's regime
+has no way to know it should scale up for a different viscosity; Re/We
+groups are the natural mechanism for a network to learn that dependence
+explicitly rather than being retuned per dataset.
 
 ### Hard Physics Constraints in Architecture
 
