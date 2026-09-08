@@ -209,20 +209,82 @@ sign-crossing-location problem, and w has been fit against real data
 Ibarra data (Current Status item 8, previously paused on the zero-drag
 ceiling) is done — see "Phase 2a real-data scalar C_D refit completed"
 under Completed Phases for the fitted value, the final reachable-condition
-set, and the out-of-sample Russell check. **Current active step**: (1)
-convert the model's/network's input features to dimensionless groups (Re,
-We, phi ratios) instead of the current ad-hoc dimensional scaling — already
-flagged as the intended Phase 2 direction under Network Architecture, and
-now more clearly motivated by the Russell out-of-sample check showing the
-scalar `C_D` fit doesn't transfer across viscosity ranges; (2) proceed to
-Phase 2b — learn the full interaction term M1 via a NN, structured (via
-those dimensionless inputs) with the explicit goal of generalizing across
-fluid pairs in a way the single scalar could not. Also concluded: NOT worth
+set, and the out-of-sample Russell check. Also concluded: NOT worth
 calibrating C_D or refitting k1/k2 specifically on Russell data (see
 "Out-of-sample validation on Russell" under Completed Phases) — only 3/17
 Russell conditions have a genuinely usable window, too few to constrain 2-3
 free parameters, and Russell is more valuable as an independent
 out-of-sample check than as a fitting target.
+
+**Sequencing decision (2026-09-03): wall friction generalization before
+drag/M1 generalization.** Both `C_D` (Phase 2a) and `k1`/`k2` (fit on
+Ibarra alone) show the same symptom — real-data generalization gaps to
+other fluid pairs — motivating a NN-based, dimensionless-input richer
+closure for whichever is tackled. Decided to do friction first, then drag
+(Phase 2b, unchanged in substance, just reordered after), for three
+reasons:
+1. **Friction is the physically dominant lever on Um/holdup** — the
+   quantities this project's validation has always centered on (Figure 10,
+   Figure 11) — while `C_D`'s only usable training signal (slip) is a much
+   narrower, back-calculation-dependent quantity.
+2. **Far more, and cleaner, supporting data.** Friction's target (Um) is
+   available across nearly the full dataset in all three fluid pairs (31
+   Ibarra, 17 Russell, ~21 comparable-Um Angeli acrylic conditions) with no
+   back-calculation needed. Drag's target (slip) requires holdup data,
+   which Angeli doesn't have at all, and which collapse/near-inversion/
+   ceiling exclusions cut down to 6 Ibarra and 3 Russell conditions — too
+   thin to reliably train a multi-input NN.
+3. **The friction picture improved substantially once a real bug was
+   caught.** The first Angeli `k1`/`k2` check (20.59% mean Um error, every
+   condition over-predicting) looked like clear evidence `k1`/`k2` don't
+   generalize toward lower viscosity — but that result was contaminated by
+   an unverified pipe length (`L` for Angeli was never documented anywhere
+   in this project). After the user supplied the correct `L=9.5`, the
+   identical check dropped to 6.55% mean error with mixed-sign residuals —
+   the signature of real (small) model error, not a systematic bug. See
+   the "Correction" note under "Out-of-sample validation on Angeli &
+   Hewitt" for the full story. Net effect: `k1`/`k2` (fit only on Ibarra)
+   generalize well toward lower viscosity with zero refitting; the only
+   confirmed remaining friction gap is toward higher viscosity (Russell:
+   22.68% Um error, 19.49% psi error).
+
+**Caveat this sequencing does NOT resolve**: a direct force-magnitude
+check (friction vs. `M1`, computed from cached plateau states at both the
+placeholder and fitted `C_D`) showed drag becomes co-equal with friction
+specifically in high-water-cut/large-slip conditions — Ibarra's own
+WC=0.8 conditions and Russell's most reliable condition (WC=0.787) all
+land at a friction/drag ratio of ~1.1-1.2x, versus 2-2000x+ elsewhere in
+the same datasets. This isn't privileged to high-viscosity fluid pairs
+specifically (it shows up in Ibarra too), so it doesn't override the
+friction-first case above, but it does mean friction generalization alone
+won't fully resolve error in that regime — drag (Phase 2b) is expected to
+matter a lot there and shouldn't be treated as indefinitely deferred.
+
+**Planned next step (friction, cheap test before NN)**: extend `k1`/`k2`
+from flat constants to a 4-parameter power-law in viscosity ratio —
+`k1 = k1_0 * (mu1/mu2)^alpha1`, `k2 = k2_0 * (mu1/mu2)^alpha2` (collapses
+back to the current flat fit at `alpha1=alpha2=0`) — fit jointly across a
+representative pooled subset of all three datasets (same
+finite-difference/full-transient scaffolding as the existing `k1`/`k2`
+fit, now 9 forward evals/gradient step instead of 5). Representative
+subset finalized 2026-09-03: **Ibarra** — the same 9 conditions already
+used for the `w`/`k1`/`k2` fit (`w_fit_conditions`: WC={0.6,0.7,0.8} at
+Um=0.50, WC={0.2,0.3,0.4,0.6,0.7,0.8} at Um=0.75 — already vetted,
+non-collapsed, non-near-inversion). **Russell** — all 3 reliable
+conditions (WC=0.197@Um=1.11, WC=0.181@Um=1.21, WC=0.787@Um=0.69); there
+aren't more to choose from. **Angeli** — 7 conditions spread across the
+comparable-Um-range acrylic set: WC={0.1429@0.77, 0.2500@0.44, 0.4000@0.55,
+0.5000@0.66, 0.6250@0.88, 0.7500@0.44, 0.8333@0.66}. Note: the existing
+`angeli_fit_conditions` (from the earlier, now-superseded Angeli `w`/`k1`/
+`k2` refit attempt) should NOT be reused for this — it was built by
+filtering against `angeli_refit_collapse_analysis.csv`, which was itself
+generated under the wrong (unverified) pipe length and is stale; the fresh
+7-condition list above was picked directly from the corrected data instead.
+Given the high-WC/drag-coupling caveat above, this fit should hold `C_D`
+fixed at its current Ibarra-fitted value (4.949e-3), not the negligible
+placeholder, so friction parameters don't silently absorb error that's
+actually drag's responsibility at the high-WC end of the pool. Not yet
+implemented.
 
 ---
 
@@ -868,34 +930,57 @@ w/k1/k2, zero refitting, under corrected physics**
 
 **Out-of-sample validation on Angeli & Hewitt (1998) — Ibarra-fitted w/k1/k2,
 zero refitting, under corrected physics**
-- Acrylic-only (same pipe material as Ibarra), comparable-Um-range subset,
-  stride=2 smoke test (11/21 conditions): mean |Um_err%| = 20.59%, median =
-  16.94%, max = 34.87%, zero NaN, zero collapse across all 11.
-- Error is systematic, not random: every single condition over-predicts Um
-  (all 11 errors positive). A one-directional bias like this is much more
-  tractable than scattered error — it's exactly the kind of thing a
-  magnitude correction (a dedicated Angeli `k1`/`k2` refit) reliably
-  cleans up, the same way it took Ibarra's own error from ~15% to ~3.2%.
-- Comparable in magnitude to Russell's zero-refit Um error (22.68%)
-  despite extrapolating in the *opposite* direction: Angeli's oil (1.6 cp)
-  is less viscous than Ibarra's (5.4 cp), while Russell's (18 cp) is more.
-  Getting similar-magnitude degradation in both directions is a reassuring
-  symmetry check on how the closure generalizes with distance from
-  Ibarra's own fluid pair.
-- Hypothesis, not yet tested: `k2=0.5853` was fit as a proportional cut to
-  oil's friction relative to Ibarra's 5.4 cp oil; applying the same
-  proportional cut to Angeli's already much-less-resistant 1.6 cp oil may
-  leave oil's total friction too low specifically for Angeli, consistent
-  with the observed one-directional over-prediction.
-- While reviewing the existing `p2b-angeli-eval-01` cell for this check,
-  found and fixed two bugs: a variable-name typo
+- First attempt (superseded, see correction below): acrylic-only, comparable-
+  Um-range subset, stride=2 smoke test (11/21 conditions) gave mean
+  |Um_err%| = 20.59%, with every single condition over-predicting Um (all 11
+  errors positive) — a systematic, one-directional bias. Built a hypothesis
+  around it: `k2=0.5853` was fit as a proportional cut to oil's friction
+  relative to Ibarra's 5.4 cp oil, so applying the same cut to Angeli's much
+  less viscous 1.6 cp oil might leave oil's friction too low specifically
+  for Angeli — i.e. treated as evidence `k1`/`k2` don't generalize across
+  viscosity the way `C_D` didn't.
+- **Correction**: that 20.59% figure and the hypothesis built on it were
+  wrong — not a real physics finding, but a symptom of an unverified pipe
+  length. `L` for Angeli was never actually documented anywhere in this
+  project (not in `angeli_hewitt_1998_pressure_gradient.csv`, which has no
+  length column, not in this file's References entry, and the only `L`
+  found near "Angeli" in the notebook was inside a dead, never-executed
+  triple-quoted string block that also had Angeli's `D` and `rho2_val`
+  mislabeled with *Ibarra's* values — a leftover copy-paste artifact, not a
+  trustworthy source). The 20.59% run was therefore against silently wrong
+  geometry, not a real out-of-sample test.
+- After the user supplied the correct pipe length (`L=9.5` m, acrylic,
+  `D=0.024` m) and a `reset-globals-angeli-01`-style cell was built for it,
+  re-running the identical 11-condition smoke test gave mean |Um_err%| =
+  6.55%, median = 6.39%, max = 11.18%, 11/11 clean (no NaN/collapse) —
+  comparable to Ibarra's own in-sample k1/k2 fit quality (~3.2-8.1%). Just
+  as tellingly, the errors are now mixed-sign
+  (+4.51, +11.18, -4.17, -3.93, -0.97, -5.44, -9.83, +8.08, -6.39, +9.28,
+  -8.25%) rather than uniformly positive — the qualitative signature of
+  genuine residual model error replacing a systematic geometry bug.
+- Revised conclusion: the Ibarra-fitted `w`/`k1`/`k2` friction closure
+  actually generalizes well toward lower oil viscosity (Angeli, 1.6 cp)
+  with zero refitting. The only *remaining*, verified friction-
+  generalization gap is toward higher viscosity (Russell, 18 cp: 22.68%
+  Um error, 19.49% psi error) — real, since Russell's geometry was
+  correctly sourced from the paper throughout, but smaller than this entry
+  previously credited it with, and one-directional (only shows up extending
+  toward higher viscosity, not lower). This meaningfully weakens the case
+  for prioritizing wall-friction generalization over drag/M1 generalization
+  (see "Current active step" below) — the drag-side gap (`C_D` on Russell:
+  225-1096% slip error) was never touched by this bug and remains the more
+  clearly broken, more severe generalization failure.
+- Also found and fixed, independent of the `L` issue, while reviewing the
+  `p2b-angeli-eval-01` cell: a variable-name typo
   (`angeli_comparab-le_acrylic`, a stray hyphen that raises a
-  `SyntaxError`) and the same w/k1/k2-not-passed-explicitly ambiguity
-  found elsewhere (relied on `time_step_learned`'s possibly-stale
-  defaults instead of passing them in).
+  `SyntaxError`) and the same w/k1/k2-not-passed-explicitly ambiguity found
+  elsewhere (relied on `time_step_learned`'s possibly-stale defaults
+  instead of passing them in explicitly).
 - Not yet done: the full comparable-Um acrylic set (stride=1, 21
   conditions) — only the 11-condition smoke-test subset has been
-  evaluated so far.
+  evaluated, now under corrected geometry. User has decided not to run the
+  full sweep for now; the 6.55% figure above stands as the current best
+  estimate but is drawn from the smaller smoke-test subset.
 
 **Phase 2a real-data scalar C_D refit completed**
 - Trigger: resuming the C_D refit paused since "C_D refit surfaces a
@@ -1675,7 +1760,12 @@ Section 8:  plotting
   998 kg/m³, 1.0 cp) run through two different pipe materials/diameters
   (stainless steel 24.3mm, roughness 7e-5m; acrylic 24.0mm, roughness
   1e-5m — note this project's friction closure has no roughness term, so
-  only acrylic is treated as directly comparable to Ibarra's setup).
+  only acrylic is treated as directly comparable to Ibarra's setup). Pipe
+  length L=9.5m (acrylic) — unlike D/roughness/fluid properties, this is
+  NOT present in `angeli_hewitt_1998_pressure_gradient.csv` and was missing
+  from this file for most of the project; running Angeli validation without
+  it produced a real, documented false result (see the "Correction" note
+  under "Out-of-sample validation on Angeli & Hewitt").
   Angeli's oil (1.6 cp) is less viscous than Ibarra's (5.4 cp) — the
   opposite direction of extrapolation from Russell's more-viscous oil. See
   "Out-of-sample validation on Angeli & Hewitt" under Completed Phases.
