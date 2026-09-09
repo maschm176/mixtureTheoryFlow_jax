@@ -286,6 +286,22 @@ placeholder, so friction parameters don't silently absorb error that's
 actually drag's responsibility at the high-WC end of the pool. Not yet
 implemented.
 
+**Nondimensionalization pass (2026-09-09):** the core solver
+(`advance_mass`, `advance_momentum`, `make_grid`, `initial_conditions`,
+`compute_dt`) and the live Phase 2a pipeline were converted from
+dimensional (SI) units to nondimensional form — see "Nondimensionalization
+of the core solver" under Completed Phases for the full breakdown of what
+needed real formula edits vs. what "just worked" once fed dimensionless
+inputs, the reference scale conventions used, and how it was validated.
+`C_D` reconfirmed at **5.065e-3** under the new code (was 4.949e-3
+pre-refactor — the small gap is expected floating-point drift over a
+1.5M-step nonlinear integration, not a physics change, confirmed via a
+direct side-by-side numerical test against the pre-refactor code).
+Everything outside the live pipeline (`w`/`k1`/`k2` fits, Russell/Angeli
+validation, older diagnostics — roughly 25 cells) is still on the old
+dimensional convention and will need the same boundary-conversion
+treatment whenever next touched.
+
 ---
 
 ## Completed Phases
@@ -1058,6 +1074,133 @@ zero refitting, under corrected physics**
   moving from a single scalar to a richer, dimensionless-input-based
   interaction term (Re, We, phi ratios) with the explicit goal of holding
   up across viscosity ranges the way this scalar fit did not.
+
+**Nondimensionalization of the core solver (Ibarra pipeline)**
+- Trigger: converted the core equations from dimensional (SI) units to
+  nondimensional form, following the standard Navier-Stokes
+  nondimensionalization convention — groundwork for generalizing more
+  robustly across fluid pairs/geometries and for future dimensionless-
+  input NN work (Phase 2b).
+- Reference scales chosen: `L_c = D` (pipe diameter, not length — matches
+  the pipe-flow literature convention and keeps `D_h_i/D`, `d_b/D`
+  clean), `U_c = Um` (mixture velocity), `rho_c = rho1` (water),
+  `t_c = D/Um`, `P_c = rho1*Um^2` (dynamic pressure). Resulting
+  dimensionless groups: `Re_i = rho1*Um*D/mu_i` (one per phase),
+  `Fr = Um/sqrt(g*D)`.
+- **Critical decision**: `Um` is NOT a single fixed global — it varies by
+  experimental condition (0.50-1.25 m/s across Ibarra alone), and isn't
+  even a true simulation input (the real inputs are `dP/dL` and water
+  cut; `Um` emerges from the sim, or is back-calculated from experimental
+  data for validation). So `Re1`/`Re2`/`Fr`/`P_c` are computed PER
+  CONDITION, inside `generate_real_dataset`'s per-row loop — right where
+  that condition's own `Um_target` first becomes a known number — not as
+  fixed globals in the "reset globals" cells.
+- **Continuity (`advance_mass`) needed zero formula changes** — proved by
+  direct substitution: every term is built purely from ratios/products of
+  `phi`, `rho`, `u`, `dx`, `dt`, with no embedded physical constant, so
+  once the inputs are already dimensionless the identical code produces
+  the correct dimensionless result. The same "free lunch" reasoning
+  applies to:
+  - `make_grid`, `initial_conditions` — pure ratios/linear interpolation,
+    no embedded constants; just feed `L_star=L/D`, `rho1_star=1.0`,
+    `rho2_star=rho2/rho1`, `p_inlet_star`/`p_outlet_star=p/(rho1*Um^2)`.
+  - `advance_momentum`'s `D_h1`/`D_h2` Taitel-Dukler geometry — since
+    `L_c=D` makes `D* = D/D = 1.0` exactly, feeding `D_star=1.0` in as
+    `D` reproduces `D_h1*`/`D_h2*` with the SAME formula, no edit needed.
+  - `advance_momentum`'s drag term `M1` — feeding `d_b_star=d_b/D` in as
+    `d_b` reproduces `M1*` unchanged. `drag_coeff`/`C_D` itself needed no
+    rescaling either — verified by dimensional analysis that it was
+    already a pure dimensionless calibration constant, in both formulas.
+- **Where the code genuinely had to change** — every case traces to a
+  bare/raw physical constant embedded directly in a formula (not passed
+  in as a rescalable argument):
+  - `advance_momentum`'s viscous stress term: `phi_i*mu_i*d2u_i_dx2` →
+    `phi_i*(1/Re_i_ref)*d2u_i_dx2`.
+  - `advance_momentum`'s gravity term: hardcoded `g=9.81` → `1/Fr_ref**2`
+    (currently inert regardless, since `theta=0` on every dataset here,
+    but now dimensionally correct rather than just coincidentally zero).
+  - `advance_momentum`'s LOCAL per-cell Reynolds number (feeds the
+    Blasius/laminar wall-friction switch): `rho_i*|u_i|*D_h_i/mu_i` →
+    `Re_i_ref*rho_i*|u_i|*D_h_i` (dividing by raw `mu_i` replaced with
+    multiplying by the reference `Re_i_ref`, since `rho_i`/`u_i`/`D_h_i`
+    are all already dimensionless by this point).
+  - `compute_dt`'s viscous-stability check: `nu_max = max(mu1/rho1_val,
+    mu2/rho2_val)` → `nu_max_star = max(1/Re1, 1/Re2)` — same reasoning:
+    kinematic viscosity has to become `1/Re`, not survive as a bare
+    `mu/rho` ratio, once `rho_val` is dimensionless but `mu` alone
+    carries no companion scale to cancel against.
+  - `advance_momentum`, `time_step`, `time_step_learned` all needed new
+    `Re1_ref`/`Re2_ref`/`Fr_ref` parameters added to their signatures —
+    plumbing, but a real signature edit, not just different call-site
+    values. Default to `None` so old dimensional call sites still parse;
+    calling with the defaults raises, since `None` can't be used in the
+    arithmetic.
+  - `generate_real_dataset` became the actual boundary-conversion layer
+    where raw experimental/physical values get turned into dimensionless
+    ones: computes `D_star=1.0`, `L_star=L/D`, `rho1_star=1.0`,
+    `rho2_star=rho2_val/rho1_val`, `d_b_star=d_b/D` once (dataset-level,
+    don't depend on `Um`), and per row `P_c`, `Re1_ref`, `Re2_ref`,
+    `Fr_ref`, `dt_star` (condition-level, from that row's own
+    `Um_target`); also nondimensionalizes `slip_target` (divides by
+    `Um_target`) so it stays comparable against the now-dimensionless
+    `slip_pred`.
+  - `loss_fn_scalar` deliberately kept its signature unchanged (still
+    accepts real `dx`/`D`/`d_b`/`dt_fixed`) and does the `dx_star`/
+    `D_star`/`d_b_star`/`dt_star` conversion internally, extracting
+    `Re1_ref`/`Re2_ref`/`Fr_ref` from the `condition` dict — so its
+    caller (cell 134/Section 7c's training loop) needed zero changes.
+- **Naming collision avoided deliberately**: the new reference Reynolds
+  numbers are named `Re1_ref`/`Re2_ref`, NOT `Re1`/`Re2` — `advance_
+  momentum` already has LOCAL variables literally named `Re1`/`Re2` (the
+  per-cell, per-timestep values feeding the Blasius/laminar switch, a
+  different, position-varying quantity). Reusing the name would have
+  silently shadowed the function argument with that local computation.
+- `mu1`/`mu2` are still accepted as parameters in `advance_momentum`/
+  `time_step`/`time_step_learned` even though no longer used internally —
+  left in place deliberately rather than removed, since removing them
+  would ripple into every caller (`loss_fn_scalar`, `generate_real_
+  dataset`, and the ~25 other cells calling `time_step_learned`
+  directly); a known, intentional half-cleanup state, not an oversight.
+- Fixed as part of this same pass (all broke under the new required
+  `Re1_ref`/`Re2_ref`/`Fr_ref` args; all use the same boundary-conversion
+  pattern as `generate_real_dataset`): the live Phase 2a pipeline
+  (`generate_real_dataset` → `loss_fn_scalar` → cell 134's training
+  loop) and the legacy `if __name__=="__main__"` demo/spinup block at
+  the bottom of the core solver cell (uses a nominal `Um_ref=1.0`, since
+  that demo has no experimentally-known `Um` — starts from rest, doesn't
+  fit a specific target).
+- **Explicitly NOT fixed, deliberately out of scope**: roughly 25 other
+  cells that call `time_step_learned` directly with their own local
+  copies of dimensional physical parameters — the `w`/`k1`/`k2` fitting
+  cells, the `C_D` fitting/ceiling-diagnostic cells, the Russell/Angeli
+  cross-validation cells, various older debugging diagnostics. All
+  currently broken (same `Re1_ref=None` `TypeError`) and will need the
+  identical boundary-conversion treatment whenever next revisited — not
+  proactively fixed now, since most are one-off historical scripts that
+  already produced and documented their final numbers.
+- **Validation**: re-ran the live Phase 2a pipeline end to end under the
+  new dimensionless code — `real_dataset` regenerated (11/12 conditions
+  usable), `C_D` refit converges to **5.065e-3** (mean slip_err 8.97%,
+  std 5.66%), close to but not identical to the original pre-refactor
+  result (`C_D=4.949e-3`, 8.68%/5.85%). Confirmed the gap is expected
+  floating-point drift, not a units bug, via a direct side-by-side
+  numerical test: ran the pre-refactor code (commit `e698714`) and the
+  new code on an identical condition (WC=0.6, Um=0.50) from identical
+  initial conditions. At 2,000 steps the two agree to ~1e-7 to 1e-11
+  relative — effectively machine precision — with the gap growing
+  gradually (not suddenly) at higher step counts, the signature of
+  ordinary rounding-error accumulation over the full 1.5M-step spinup
+  plus 30 training epochs, not a formula error. Treat `C_D=5.065e-3`
+  (the dimensionless-code result) as the current reference value going
+  forward, superseding but consistent with `4.949e-3`.
+- Also fixed along the way: a near-miss where `quiet_window_selection.pkl`
+  turned out to be empty (0 entries, from a stale run where the
+  classification step apparently ran before the sweep it depends on had
+  populated `oscillation_sweep_results` in memory). Rebuilt correctly by
+  loading the still-valid cached `oscillation_sweep_results.pkl` (raw
+  sweep data survives a units refactor unchanged, since nondimension-
+  alizing doesn't alter the underlying physical trajectory, only the
+  units it's expressed in) and re-running just the classification cell.
 
 ---
 
