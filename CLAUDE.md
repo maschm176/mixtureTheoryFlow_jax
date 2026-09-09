@@ -120,14 +120,14 @@ sign-crossing-location problem, and w has been fit against real data
    different effective drag — something one shared constant C_D structurally
    cannot represent, no matter how well-optimized. Added a lightweight
    two-parameter test (Section 7d) as a cheap intermediate check before
-   committing to a full Phase 2b: two independent scalars, `C_D_pos` and
+   committing to a full Phase 2e: two independent scalars, `C_D_pos` and
    `C_D_neg`, split by the *sign of each condition's own experimentally-
    measured target slip* (not learned — the data already tells us which
    physical regime a condition is in). Kept fully separate from the
    1-parameter baseline (own variables, own checkpoint files) so both
    results stay directly comparable. If both regimes fit well with their
    own dedicated scalar, that's direct evidence the fix needs a regime-
-   dependent closure, strengthening the case for Phase 2b; if one regime
+   dependent closure, strengthening the case for Phase 2e; if one regime
    still struggles even with its own parameter, the remaining gap isn't
    simply "pre- vs. post-inversion." **Not yet run/evaluated as of this
    note** — see Section 7d output for results once available.
@@ -221,7 +221,7 @@ drag/M1 generalization.** Both `C_D` (Phase 2a) and `k1`/`k2` (fit on
 Ibarra alone) show the same symptom — real-data generalization gaps to
 other fluid pairs — motivating a NN-based, dimensionless-input richer
 closure for whichever is tackled. Decided to do friction first, then drag
-(Phase 2b, unchanged in substance, just reordered after), for three
+(Phase 2e, unchanged in substance, just reordered after), for three
 reasons:
 1. **Friction is the physically dominant lever on Um/holdup** — the
    quantities this project's validation has always centered on (Figure 10,
@@ -257,7 +257,7 @@ land at a friction/drag ratio of ~1.1-1.2x, versus 2-2000x+ elsewhere in
 the same datasets. This isn't privileged to high-viscosity fluid pairs
 specifically (it shows up in Ibarra too), so it doesn't override the
 friction-first case above, but it does mean friction generalization alone
-won't fully resolve error in that regime — drag (Phase 2b) is expected to
+won't fully resolve error in that regime — drag (Phase 2e) is expected to
 matter a lot there and shouldn't be treated as indefinitely deferred.
 
 **Planned next step (friction, cheap test before NN)**: extend `k1`/`k2`
@@ -657,7 +657,7 @@ drag closure choice, is the binding constraint**
   simulation at that limit. This means the achievable slip ceiling is set
   ENTIRELY by non-drag physics and is invariant to which drag closure is
   chosen — so neither switching to the stratified interfacial drag formula
-  originally planned for Phase 2b, nor a full NN-learned M1, would resolve
+  originally planned for Phase 2e, nor a full NN-learned M1, would resolve
   the unreachable conditions. Both would hit the identical ceiling for the
   identical reason.
 - Decision: redirect focus toward wall friction MAGNITUDE (distinct from
@@ -672,7 +672,7 @@ drag closure choice, is the binding constraint**
   cheap scalar test before considering a richer NN-learned friction
   correction, same "cheap test before full commitment" philosophy already
   used for w before S_i, and originally intended for C_D_pos/C_D_neg before
-  Phase 2b.
+  Phase 2e.
 - Literature check: searched for prior work on this exact issue before
   committing further effort, given how confidently the physics pointed at
   wall/interfacial friction. Found strong, direct confirmation this is a
@@ -1070,7 +1070,7 @@ zero refitting, under corrected physics**
   right magnitude, outside the regime it was fit on.
 - Decision: do NOT chase a Russell-specific `C_D` (same reasoning as
   `w`/`k1`/`k2` — too few usable Russell conditions to fit robustly).
-  Instead, treat this generalization gap as motivation for Phase 2b:
+  Instead, treat this generalization gap as motivation for Phase 2e:
   moving from a single scalar to a richer, dimensionless-input-based
   interaction term (Re, We, phi ratios) with the explicit goal of holding
   up across viscosity ranges the way this scalar fit did not.
@@ -1080,7 +1080,7 @@ zero refitting, under corrected physics**
   nondimensional form, following the standard Navier-Stokes
   nondimensionalization convention — groundwork for generalizing more
   robustly across fluid pairs/geometries and for future dimensionless-
-  input NN work (Phase 2b).
+  input NN work (Phase 2e).
 - Reference scales chosen: `L_c = D` (pipe diameter, not length — matches
   the pipe-flow literature convention and keeps `D_h_i/D`, `d_b/D`
   clean), `U_c = Um` (mixture velocity), `rho_c = rho1` (water),
@@ -1482,7 +1482,61 @@ Phase 2a:  Ibarra data       → learn C_D scalar    → loss: slip (back-calcul
            See "Phase 2a real-data scalar C_D refit completed" under
            Completed Phases.
 
-Phase 2b:  Ibarra data       → learn full M1       → loss: phi1 + u1  [CURRENT NEXT STEP]
+Phase 2b:  Ibarra-fitted     → validate k1, k2     → zero-refit check      [COMPLETE]
+           w/k1/k2 applied     wall friction          against Um/psi
+           to Russell +        magnitude
+           Angeli datasets     multipliers
+           Zero-refit out-of-sample check of the Ibarra-fitted w/k1/k2 wall
+           friction magnitude multipliers (k1=1.1102, k2=0.5853) against two
+           independent fluid pairs/geometries. Russell (18 cp oil, more
+           viscous than Ibarra's 5.4 cp): Um mean |err%|=22.68%, psi mean
+           |err%|=19.49% -- a real, one-directional generalization gap
+           toward higher viscosity. Angeli (1.6 cp oil, less viscous):
+           Um mean |err%|=6.55%, mixed-sign residuals -- generalizes well
+           toward lower viscosity with zero refitting. See "Out-of-sample
+           validation on Russell" and "Out-of-sample validation on Angeli &
+           Hewitt" under Completed Phases.
+
+Phase 2c:  Ibarra + Russell  → power-law k1, k2    → loss: Um (relative     [CURRENT NEXT STEP]
+           + Angeli data       in viscosity ratio     error per condition)
+                                k1=k1_0*(mu1/mu2)^alpha1
+                                k2=k2_0*(mu1/mu2)^alpha2
+           Cheap test of whether a richer (but still simple, 4-parameter)
+           functional form for the friction magnitude multipliers actually
+           buys anything over the flat k1/k2 scalars, before paying the
+           cost/complexity of a full NN. Collapses back to the current flat
+           fit at alpha1=alpha2=0. Fit jointly via the same finite-
+           difference/full-transient scaffolding as the existing k1/k2 fit
+           (9 forward evals/gradient step instead of 5), across the
+           representative 19-condition pooled subset already finalized
+           (9 Ibarra, 3 Russell, 7 Angeli -- see "Planned next step
+           (friction, cheap test before NN)" under Current Status for the
+           exact condition list). C_D held fixed at its Ibarra-fitted value
+           so friction parameters don't silently absorb drag's share of
+           error at the high-WC end of the pool. Not yet implemented.
+
+Phase 2d:  Using a NN to learn Wall Friction Model Parameters k1, k2
+           Ibarra + Russell  → NN-learned k1, k2   → loss: Um (relative
+           + Angeli data       as functions of       error per condition)
+                                dimensionless inputs
+           Motivated by Phase 2b's confirmed higher-viscosity generalization
+           gap. Only pursued if Phase 2c's power-law test shows a richer
+           functional form is worth the added complexity -- replace the flat
+           k1/k2 scalars (or the power-law's 4 parameters) with a small
+           network, k1_eff, k2_eff = FrictionCorrectionNetwork(Re1_ref,
+           Re2_ref, WC), softplus-activated for positivity, still
+           multiplying the existing physically-derived Taitel-Dukler/Blasius
+           friction terms unchanged -- structure preserved, only the
+           magnitude correction is learned (same philosophy as "Why Learn
+           C_D First" below). Open design question: whether a short
+           differentiable window (like C_D's) shows enough Um sensitivity to
+           k1/k2 to train via jax.grad, or whether it needs the full
+           ~370,000-step transient the way w/k1/k2's finite-difference fit
+           did -- backprop can't lean on the finite-difference workaround
+           for many network weights the way a single scalar can (see
+           Current Status). Not yet implemented.
+
+Phase 2e:  Ibarra data       → learn full M1       → loss: phi1 + u1
            ~24 data points, proof-of-concept only
            requires stratified drag formulation (current dispersed bubble wrong)
            Motivated directly by Phase 2a's generalization gap: switch
@@ -1491,21 +1545,21 @@ Phase 2b:  Ibarra data       → learn full M1       → loss: phi1 + u1  [CURRE
            regime-specific magnitude, with the explicit goal of holding up
            across viscosity ranges the way the scalar didn't.
 
-Phase 2c:  larger dataset    → learn full M1       → loss: phi1 + u1
+Phase 2f:  larger dataset    → learn full M1       → loss: phi1 + u1
            Arirachakaran, Lovick-Angeli, Elseth, etc.
 ```
 
-Note: richer M1 (Phase 2b/2c) does not by itself resolve the vanishing-phase
+Note: richer M1 (Phase 2e/2f) does not by itself resolve the vanishing-phase
 singularity that bounds usable WC range (e.g. WC=0.1) -- see "Current
 Limitation: Vanishing-Phase Singularity" under Known Issues.
 
-Note: before committing to full Phase 2b, a much lighter intermediate test
+Note: before committing to full Phase 2e, a much lighter intermediate test
 was added (Section 7d) — two independent C_D scalars (`C_D_pos`/`C_D_neg`)
 instead of one, split by the sign of each condition's target slip
 (pre-/post-inversion), rather than a full NN-learned M1. This directly tests
 whether the single-scalar plateau (see Current Status, item 7) is a
 regime-dependence problem specifically, before paying the cost of the full
-Phase 2b effort. **Superseded** — see the note on Current Status item 7.
+Phase 2e effort. **Superseded** — see the note on Current Status item 7.
 
 **Redirect**: a zero-drag-ceiling sweep (see "C_D refit surfaces a
 fundamental ceiling..." under Completed Phases) established that *any*
@@ -1514,7 +1568,7 @@ interfacial, or a full NN-learned M1 — collapses to the identical
 zero-drag simulation as its coefficient → 0, so the achievable slip range
 is set entirely by non-drag physics (wall friction) and is invariant to
 which drag closure is chosen. This means richer M1 formulations (Phase
-2b/2c as originally scoped) would not resolve the currently-unreachable
+2e/2f as originally scoped) would not resolve the currently-unreachable
 conditions. Current priority has shifted to characterizing and correcting
 wall friction *magnitude* first (Current Status, item 9) — with the
 expectation that "the NN" (if still needed once a simple scalar correction
@@ -1526,8 +1580,8 @@ viscosity and the fresh w/k1/k2 refit — see "Zero-drag-ceiling sweep
 rechecked under corrected physics" under Completed Phases. The ceiling has
 moved substantially: only 4/11 trained Ibarra conditions remain
 structurally unreachable, down from most. This means a richer M1 (Phase
-2b) is no longer blocked the way it was — the same recheck logic applies
-to it as to scalar C_D, so before committing to full Phase 2b it's worth
+2e) is no longer blocked the way it was — the same recheck logic applies
+to it as to scalar C_D, so before committing to full Phase 2e it's worth
 confirming which of the two (resume scalar C_D refit, or go straight to
 learning M1) makes more sense now that the ceiling is far less binding.
 Not yet decided — see "Current active step" under Current Status.
@@ -1741,8 +1795,8 @@ to the dominant phase's directly in the momentum→velocity recovery step
 (u_i = mom_i/(phi_i*rho_i) diverges as phi_i→0) -- **downstream of every
 force term, including M1.**
 
-Consequence for future phases: richer M1 formulations (Phase 2b's full
-NN-learned M1, Phase 2c's larger dataset) will **not** resolve this on their
+Consequence for future phases: richer M1 formulations (Phase 2e's full
+NN-learned M1, Phase 2f's larger dataset) will **not** resolve this on their
 own. The collapse override is a property of the two-fluid (Eulerian-
 Eulerian) formulation itself -- the 1/phi_i singularity as a phase vanishes
 exists regardless of what closure computes the momentum source terms, and
@@ -1847,11 +1901,11 @@ Section 8:  plotting
   → Not a two-fluid model — fractional flow / drift flux approach.
 
 - Arirachakaran et al. (1989). SPE-18836-MS.
-  → Oil-water horizontal pipe data. 1,200 data points. Future dataset for Phase 2c.
+  → Oil-water horizontal pipe data. 1,200 data points. Future dataset for Phase 2f.
 
 - Trallero JL (1995). "Oil-Water Flow Pattern in Horizontal Pipes."
   PhD Dissertation, University of Tulsa.
-  → Most comprehensive raw oil-water holdup dataset. Target for Phase 2c.
+  → Most comprehensive raw oil-water holdup dataset. Target for Phase 2f.
 
 - Taitel Y, Dukler AE (1976). Original stratified flow model paper — assumed
   a *constant* ratio between interfacial and wall friction factor, since
