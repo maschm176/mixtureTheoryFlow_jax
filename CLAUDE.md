@@ -286,6 +286,26 @@ placeholder, so friction parameters don't silently absorb error that's
 actually drag's responsibility at the high-WC end of the pool. Not yet
 implemented.
 
+**New intermediate phase decided (2026-09-22): gas-water generalization
+check (Phase 2g), interposed before continuing Phase 2c.** Motivated by
+wanting a stronger stress test of whether the current closure
+(Taitel-Dukler geometry + S_i/w + k1/k2 + C_D, all fit exclusively on
+liquid-liquid oil-water data) generalizes at all to a categorically
+different fluid pair — gas-liquid, not just a second oil-water dataset —
+before investing further effort refining k1/k2 across three liquid-liquid
+datasets. See "Phase 2g: Gas-Water Generalization Check" under Three-Phase
+Plan for the full six-step layout. Scoped horizontal-only for this first
+pass — inclination, and the gravity term it would finally exercise (wired
+in during nondimensionalization but never yet used by any dataset so far),
+deferred to a later decision. Dataset not yet finalized: Beggs & Brill
+(1972) Table III is the leading candidate (already referenced under
+References; two orphaned, never-committed scaffolding scripts already
+exist in the repo — `beggs_brill_validation.py`, `bb_to_model_inputs.py`
+— with ideal-gas air-density and B&B unit-conversion logic already worked
+out, though the raw Table III data itself still needs sourcing/
+digitizing); other stratified air-water datasets (Mandhane et al.,
+Andritsos & Hanratty) remain open alternatives. Not yet implemented.
+
 **Nondimensionalization pass (2026-09-09):** the core solver
 (`advance_mass`, `advance_momentum`, `make_grid`, `initial_conditions`,
 `compute_dt`) and the live Phase 2a pipeline were converted from
@@ -1496,6 +1516,89 @@ Phase 2b:  Ibarra-fitted     → validate k1, k2     → zero-refit check      [
            toward lower viscosity with zero refitting. See "Out-of-sample
            validation on Russell" and "Out-of-sample validation on Angeli &
            Hewitt" under Completed Phases.
+
+Phase 2g:  New fluid pair    → zero-refit check    → Um/psi/dP-dL error    [PLANNED --
+           (gas-water,         of current fully-      against a gas-liquid  RUNS BEFORE 2c]
+           dataset TBD)        calibrated closure      dataset
+           Gas-Water Generalization Check. A stronger stress test than
+           Phase 2b: gas-liquid is a categorically different fluid pair
+           (density ratio ~0.001-0.01 vs. oil/water's ~0.83; viscosity
+           ratio ~0.02 vs. ~6; compressible gas phase; a much richer flow
+           regime map), not just a second liquid-liquid dataset -- decided
+           to interpose this before continuing Phase 2c's power-law fit,
+           since the result could reshape what 2c/2d should even
+           prioritize next. Labeled "2g" (out of numeric sequence) rather
+           than renumbering the already-established 2c-2f, matching this
+           document's existing practice of layering sequencing decisions
+           on top of the nominal phase order rather than renaming phases
+           each time priority shifts (see "Sequencing decision
+           (2026-09-03)" under Current Status). Scoped horizontal-only for
+           this first pass; inclined runs (and the gravity term, wired in
+           during nondimensionalization but never yet exercised by any
+           dataset used so far) deferred.
+
+           Six-step layout:
+           1. Source & format a horizontal gas-water dataset into the same
+              per-condition CSV shape as Ibarra/Russell (input gas
+              fraction, Um_target, holdup psi if available, dP/dL if
+              available, plus P/T at test conditions so gas density can be
+              computed rather than assumed). Dataset not yet finalized --
+              Beggs & Brill (1972) Table III is the leading candidate
+              (already referenced under References; two orphaned,
+              never-committed scaffolding scripts already exist in the
+              repo -- beggs_brill_validation.py, bb_to_model_inputs.py --
+              with ideal-gas air-density and B&B unit-conversion logic
+              already worked out, though the raw Table III data itself
+              still needs sourcing/digitizing). Other stratified air-water
+              datasets (Mandhane et al., Andritsos & Hanratty) remain open
+              alternatives.
+           2. Flow-regime pre-filter, done proactively this time (for
+              Ibarra this was only done reactively, after a bad fit,
+              via the Figure 6 cross-check -- see "Wall friction upgrade"
+              under Completed Phases). Gas-liquid horizontal flow has a
+              much richer regime map (stratified -> wavy -> plug -> slug
+              -> annular -> dispersed) than oil-water's; filter to
+              stratified/stratified-wavy conditions before running
+              anything, using whatever regime classification the source
+              dataset provides, since the 1D steady-plateau model has no
+              way to represent slug intermittency.
+           3. New reset-globals cell for the fluid pair, following the
+              reset-globals-russell-01/-angeli-01 pattern, with one open
+              decision: whether gas density can stay a fixed rho2_val
+              (fine if the dataset's pressure range is narrow/near-
+              atmospheric) or needs to be computed per-condition from the
+              ideal gas law (reusing the logic already sitting in
+              beggs_brill_validation.py) -- to be checked against the
+              actual chosen dataset's pressure range, not assumed.
+           4. Zero-refit forward check: run the current, fully
+              Ibarra-fitted closure (Taitel-Dukler geometry + S_i/w +
+              k1/k2 + C_D, no tuning) against the filtered conditions,
+              exactly like the Russell/Angeli checks in Phase 2b. Report
+              Um and holdup error (dP/dL too, if available).
+           5. Oscillation/collapse sweep, reusing the existing three-gate
+              methodology unchanged (quiet + developed + not-collapsed --
+              see the Phase 2a real-data pipeline pattern / "Phase
+              inversion physics investigation" under Completed Phases).
+              Worth doing regardless of step 4's outcome -- gas-liquid
+              stratified flow tends toward lower liquid holdup than the
+              oil-water cases fit so far, plausibly closer to the
+              PHI_COLLAPSE threshold more often.
+           6. Decision branch: if the zero-refit error is structured (not
+              random noise, and not a one-directional bias that turns out
+              to be a boundary-condition/setup bug on closer inspection --
+              check that first, same lesson as the Angeli pipe-length
+              incident under "Out-of-sample validation on Angeli &
+              Hewitt"), recalibrate. Try friction magnitude (k1/k2) first,
+              same reasoning as the existing oil-water sequencing decision
+              (friction dominates Um by ~54,000x over drag). Only if that
+              can't close the gap, revisit the drag formula's actual
+              structure -- flagged now as an open question: M1 has rho1
+              (water's density) baked in as a proxy for "the dense
+              phase," a reasonable simplification when both phases were
+              liquids of comparable density, but possibly wrong once one
+              phase is ~1000x lighter.
+
+           Not yet implemented.
 
 Phase 2c:  Ibarra + Russell  → power-law k1, k2    → loss: Um (relative     [CURRENT NEXT STEP]
            + Angeli data       in viscosity ratio     error per condition)
