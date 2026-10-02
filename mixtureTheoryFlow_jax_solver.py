@@ -67,6 +67,18 @@ jax.config.update("jax_enable_x64", True)
 PHI_COLLAPSE = 0.1
 #PHI_COLLAPSE = 0.075
 
+# dt_fixed/n_spinup are relied on as bare globals throughout the notebook
+# (dt_fixed: fixed integration step; n_spinup: default 150s spinup step
+# count). They used to live inside the `if __name__ == "__main__":` block
+# below, which only executes when this file runs as a script -- harmless
+# when this was the notebook's own cell (Jupyter's interactive namespace
+# IS `__main__`), but silently left both undefined once this code moved
+# into an imported module (`__name__` becomes the module's own name on
+# import, so that block never runs). Hoisted here so they're always
+# defined, regardless of how this file is loaded.
+dt_fixed = 1e-4      # [s]
+n_spinup = int(150.0 / dt_fixed)   # 1,500,000 -- default 150s spinup duration
+
 
 # =============================================================================
 # SECTION 1: GRID SETUP
