@@ -306,6 +306,50 @@ out, though the raw Table III data itself still needs sourcing/
 digitizing); other stratified air-water datasets (Mandhane et al.,
 Andritsos & Hanratty) remain open alternatives. Not yet implemented.
 
+**Phase 2g update (2026-10-07): both candidate datasets are dominated by
+collapsed conditions — PHI_COLLAPSE is now the binding blocker, before the
+closure itself has even been tested.** Two datasets were sourced and built
+(superseding "Dataset not yet finalized" above): a 32-row combined dataset
+digitized from Carraretto et al. (2020, MDPI) Figures 6/9/10
+(`mdpi_airwater_phase2g_dataset.csv`), and a 13-condition horizontal subset
+of Fan (2005) pulled from a larger literature compilation
+(`fan2005_sw_subset.csv`, filtered `Authors=="Fan, Y."`,
+`Flow Pattern=="SW"`). Running the existing oscillation/collapse sweep
+(step 5 below) against both surfaced the same problem anticipated
+qualitatively in step 5's original text, but far more severe than
+expected:
+- **Fan (2005), horizontal subset: 13/13 conditions collapsed for the
+  entire simulated duration**, confirmed by direct pickle inspection
+  (`phi_min` pinned exactly at each condition's inlet `WC` from the first
+  chunk through the last — the run never leaves the collapsed state
+  because it starts collapsed). Inlet `WC` (liquid cut) for this subset
+  ranges 3e-5 to 1.6e-3 — three to four orders of magnitude below
+  `PHI_COLLAPSE=0.1`.
+- **MDPI (Carraretto): the entire 32-row dataset sits at or below the
+  collapse threshold.** `WC ≈ C_L`, and across both digitized figures `WC`
+  ranges only ~0.025-0.125 — not a tail case, the whole dataset.
+- Root cause is physical, not a data-sourcing error: stratified
+  gas-liquid flow routinely runs at low liquid holdup because gas occupies
+  most of the cross-section at these flow rates, so low liquid fraction is
+  the *regime*, not an unlucky corner of it, unlike oil-water's WC=0.1-0.9
+  spread (chosen symmetric around inversion), where `PHI_COLLAPSE` only
+  ever bound the WC=0.1 tail. See "Current Limitation: Vanishing-Phase
+  Singularity Dominates (Not Just Bounds) Gas-Liquid Data" under Known
+  Issues for the full writeup, including a second, compounding
+  density-ratio conditioning issue specific to gas-liquid.
+- **Not yet resolved — open decision, not yet made**: (a) try lowering
+  `PHI_COLLAPSE` now that these datasets provide a maximally-stressed test
+  case (risk: it was never validated at a much smaller value, and the
+  "safe substitution" `jnp.where` pattern it relies on was only exercised
+  near 0.1-scale thresholds so far); (b) treat Fan (2005) horizontal rows
+  as a dead end for this closure as-is and look at Fan's inclined rows or
+  a different paper with higher liquid holdup; (c) revisit the
+  vanishing-phase formulation itself (flagged as the "real" fix in the
+  Known Issues entry, but a substantially larger undertaking than either
+  (a) or (b)). Blocks step 4 (zero-refit forward check) and step 6
+  (recalibration decision) below until resolved, since there's currently
+  no non-collapsed subset of either dataset to run either step against.
+
 **Nondimensionalization pass (2026-09-09):** the core solver
 (`advance_mass`, `advance_momentum`, `make_grid`, `initial_conditions`,
 `compute_dt`) and the live Phase 2a pipeline were converted from
@@ -1583,6 +1627,16 @@ Phase 2g:  New fluid pair    → zero-refit check    → Um/psi/dP-dL error    [
               stratified flow tends toward lower liquid holdup than the
               oil-water cases fit so far, plausibly closer to the
               PHI_COLLAPSE threshold more often.
+              **Confirmed, worse than anticipated (2026-10-07)**: this
+              isn't an occasional problem -- it's nearly total. Fan (2005)
+              horizontal subset is 13/13 collapsed for the entire run
+              (inlet WC three to four orders of magnitude below
+              PHI_COLLAPSE); MDPI's entire 32-row dataset sits at or below
+              the threshold (WC range ~0.025-0.125). See the Phase 2g
+              update under Current Status and "Current Limitation:
+              Vanishing-Phase Singularity Dominates (Not Just Bounds)
+              Gas-Liquid Data" under Known Issues. Steps 4 and 6 below are
+              blocked until this is resolved one way or another.
            6. Decision branch: if the zero-refit error is structured (not
               random noise, and not a one-directional bias that turns out
               to be a boundary-condition/setup bug on closer inspection --
@@ -1920,6 +1974,68 @@ WC=0.8@Um=0.5 was excluded from Phase 1's synthetic set for the same reason
 -- a collapsed condition contributes ~zero gradient signal (C_D cannot move
 slip_pred away from 0) while permanently dragging the average loss up, since
 it can never be fit no matter what C_D is tried.
+
+### Current Limitation: Vanishing-Phase Singularity Dominates (Not Just
+Bounds) Gas-Liquid Data
+
+Discovered during Phase 2g (gas-water generalization check). The
+vanishing-phase singularity above was characterized entirely on oil-water
+data, where it only ever bound a tail case (WC=0.1, one excluded
+condition out of dozens). Testing the Ibarra-fitted closure against two
+gas-water datasets showed this doesn't hold for gas-liquid -- the same
+mechanism instead collapses nearly the entire dataset, before the
+friction/drag closure itself has even been exercised:
+
+- **Fan (2005), horizontal subset (13 conditions): 100% collapsed for the
+  entire simulated duration.** Confirmed by direct pickle inspection
+  (`fan2005_oscillation_sweep_results.pkl`) -- `phi_min` sits pinned
+  exactly at each condition's inlet `WC` from the first chunk through the
+  last, meaning the run never leaves the collapsed state because it
+  *starts* collapsed at t=0, straight from the boundary condition. Inlet
+  `WC` for this subset ranges from 3e-5 to 1.6e-3 -- three to four orders
+  of magnitude below `PHI_COLLAPSE=0.1`.
+- **MDPI (Carraretto et al. 2020): the entire 32-row dataset sits at or
+  below the collapse threshold**, not just a subset of it. `WC` (liquid
+  cut) is `≈ C_L`, which ranges only ~0.025-0.125 across both digitized
+  figures used (6, 9/10).
+
+Root cause is physical, not a data-sourcing artifact: stratified
+gas-liquid flow routinely operates at low liquid holdup because gas
+occupies most of the cross-section at these flow rates -- low liquid
+fraction is the *regime* being measured, not an unlucky corner of it.
+Oil-water's WC=0.1-0.9 spread was chosen by experimenters symmetric around
+phase inversion, so `PHI_COLLAPSE=0.1` only ever clips one physically
+extreme tail; nothing about gas-liquid stratified flow guarantees liquid
+holdup stays anywhere near that range -- in these two datasets, it never
+does.
+
+**A second, compounding issue, specific to gas-liquid and distinct from
+the phi-threshold itself**: velocity recovery for the gas phase is
+`u2 = mom2/(phi2*rho2_star)`, and `rho2_star = rho_gas/rho_water` is
+~0.001-0.01 for air-water -- already a tiny number before multiplying by
+`phi2`. This means the gas phase's recovered velocity is noise-sensitive
+at *any* `phi2`, not only once `phi2` itself crosses the 0.1 threshold,
+because the denominator is small from the density ratio alone. This is a
+hypothesis raised by the density-ratio arithmetic, not yet confirmed by a
+dedicated numerical test -- but it implies `PHI_COLLAPSE=0.1` (tuned and
+validated entirely at oil-water's `rho2_star≈0.83`) may not even be the
+right threshold value once density ratio is this extreme, separate from
+the question of which phase is collapsing.
+
+Consequence: the same conclusion as the oil-water entry above applies with
+more force here -- no closure refinement (friction k1/k2, drag C_D or a
+richer M1) can fix this, since the collapse override sits downstream of
+every force term and triggers from the boundary condition itself in the
+most-collapsed cases. Unlike oil-water, this can't be worked around by
+excluding a handful of tail conditions, since there is currently no
+non-collapsed subset of either gas-water dataset left to validate against.
+Open decision, not yet made (see the Phase 2g update under Current
+Status): lower `PHI_COLLAPSE` and see whether the "safe substitution"
+pattern still holds up at a much smaller value, look for a gas-liquid
+dataset with higher liquid holdup (e.g. Fan's inclined rows, a different
+paper), or treat this as the forcing function to finally revisit the
+two-fluid formulation's vanishing-phase handling itself rather than
+continuing to patch around it per-dataset.
 
 ### Drift Flux Sign
 
