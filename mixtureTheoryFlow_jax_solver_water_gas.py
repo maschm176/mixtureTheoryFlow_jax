@@ -1478,8 +1478,8 @@ def predicted_pressure_gradient(alpha_l, Delta, Q, D, rho_l, rho_g, mu_l, mu_g,
 
 
 def run_stage6_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
-                          n_transit_times=30.0, cfl=0.25, g=9.81, f_i_mult=1.0,
-                          theta=1.3):
+                          n_transit_times=100.0, cfl=0.25, g=9.81, f_i_mult=1.0,
+                          theta=1.3, outlet_window=10):
     """
     Run one real-data condition to (approximate) steady state and return
     the diagnostics needed to validate against it: predicted outlet
@@ -1495,6 +1495,33 @@ def run_stage6_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
     nearly three orders of magnitude, so a single fixed dt/n_steps would
     be either unstable on the fast conditions or wastefully slow on the
     slow ones.
+
+    n_transit_times was raised from 30 to 100 after a longer-run check
+    (sampling convergence at 30/60/100/.../300 transit times on the worst
+    disagreeing conditions from the first Stage 6 pass) showed most
+    flagged conditions settle cleanly -- EXACTLY (disagree -> 0.0000) --
+    by 60-100 transit times, just not yet at 30.
+
+    outlet_window: a SEPARATE, different problem that longer runtime does
+    NOT fix. A couple of conditions in that same check kept disagreeing
+    even at 300 transit times, but their alpha_l profile was already
+    completely flat -- the holdup itself is genuinely converged. Dumping
+    the raw per-cell values (not just the aggregate disagreement number)
+    found the real cause: these conditions converge to a liquid Reynolds
+    number sitting almost exactly ON fanning_wall_shear's laminar/
+    turbulent cutoff (Re=2100), and floating-point-level noise in alpha_l
+    (~1e-6) is enough to flip individual cells across that DISCONTINUOUS
+    switch -- producing a dense cluster of "clean" cells plus a minority
+    of large-magnitude outlier cells sitting on the other branch. A
+    single-cell read (the old `[-2]` index) has no way to tell which
+    branch is "correct"; see the median-vs-mean comment right where
+    outlet_window is actually used below for why a plain window MEAN
+    isn't the fix either (it still gets dragged by the outliers) and a
+    MEDIAN is. One condition was found to sit close enough to exactly
+    50/50 across that discontinuity that even the median can't recover a
+    trustworthy value -- a genuine, open limitation of the friction
+    closure itself, not something this diagnostic-side fix can paper
+    over.
     """
     Q = U_sl + U_sg
     dx = L / N
@@ -1521,11 +1548,34 @@ def run_stage6_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
         step, init_carry, None, length=n_steps
     )
 
-    alpha_l_outlet = final_state['alpha_l'][-2]   # last real cell (index -1 is the ghost copy)
-    Delta_outlet   = final_state['Delta'][-2]
-    dPdz_l, dPdz_g = predicted_pressure_gradient(
-        alpha_l_outlet, Delta_outlet, Q, D, rho_l, rho_g, mu_l, mu_g, f_i_mult
+    # Window outlet diagnostics -- last `outlet_window` INTERIOR cells,
+    # excluding the ghost copy at index -1 (see advance_state_stage5: the
+    # last cell is always a verbatim copy of the second-to-last, so
+    # including it would double-count one real value rather than add an
+    # independent sample).
+    #
+    # MEDIAN, not mean: a plain mean was tried first and made things WORSE
+    # on some conditions. Root cause, found by dumping the raw per-cell
+    # values directly rather than trusting the aggregate number: a few
+    # conditions converge to a liquid Reynolds number sitting almost
+    # exactly ON fanning_wall_shear's laminar/turbulent cutoff (Re=2100) --
+    # e.g. one Fan 2005 condition converges to Re_l=2100.78, and floating-
+    # point-level noise in alpha_l (~1e-6, far below anything physically
+    # meaningful) is enough to flip individual cells across that
+    # DISCONTINUOUS switch, producing a few huge outlier dPdz values
+    # (dense cluster near -167 with sparse spikes to +141) alongside
+    # otherwise-clean neighbors. A mean lets those rare, large outliers
+    # dominate the result; a median ignores them entirely as long as they
+    # stay a minority of the window, recovering the same clean value the
+    # majority of cells already agree on.
+    alpha_l_window = final_state['alpha_l'][-(outlet_window + 1):-1]
+    Delta_window   = final_state['Delta'][-(outlet_window + 1):-1]
+    dPdz_l_arr, dPdz_g_arr = predicted_pressure_gradient(
+        alpha_l_window, Delta_window, Q, D, rho_l, rho_g, mu_l, mu_g, f_i_mult
     )
+    alpha_l_outlet = jnp.median(alpha_l_window)
+    dPdz_l = jnp.median(dPdz_l_arr)
+    dPdz_g = jnp.median(dPdz_g_arr)
 
     any_nan = bool(jnp.any(jnp.isnan(final_state['alpha_l'])) or
                    jnp.any(jnp.isnan(final_state['Delta'])))
