@@ -4,10 +4,15 @@ Water-Gas Reduced Two-Fluid Pipe Flow Solver (JAX)
 
 Reduced-model solver for horizontal stratified gas-liquid pipe flow,
 replacing the oil-water (phi1, phi2, mom1, mom2) + pressure-projection
-solver this file started as a copy of. See the design doc ("Two-Fluid
-Pipe Flow Solver -- Reduced Model Refactor") for the full plan; this file
-is built up stage by stage, each with its own acceptance test, rather than
-all at once.
+solver this file started as a copy of. Built and verified in 6 stages
+against a design doc ("Two-Fluid Pipe Flow Solver -- Reduced Model
+Refactor"), each with its own acceptance test; this file holds the final,
+condensed result -- superseded intermediate scheme variants (plain
+Lax-Friedrichs flux, a single global wave speed, symmetric Rusanov
+dissipation, first-order-in-space reconstruction) were deleted once the
+final scheme (central-upwind + minmod reconstruction + positivity
+correction + Strang-split implicit friction) had been validated against
+each of them in turn.
 
 WHY A NEW FORMULATION (not just reusing the old phi/mom state):
   1. Velocity recovery in the old solver divides momentum by volume
@@ -29,20 +34,22 @@ fraction and Delta = rho_l*u_l - rho_g*u_g. Velocities are recovered from
 (alpha_l, Delta, Q) with NO division by alpha_l anywhere (Q = U_sl + U_sg,
 the fixed total superficial velocity) -- this directly removes problem #1
 above by construction, rather than patching it with a floor/cutoff.
-Pressure becomes a post-processing-only quantity for validation, not part
-of the evolved state.
+Pressure is a post-processing-only quantity for validation, never part of
+the evolved state.
 
-NUMERICS (Change A, built up across Stages 1-5): semi-discrete
-central-upwind flux (Kurganov-Noelle-Petrova) with minmod reconstruction
-and the Kurganov-Petrova (2007) positivity correction on alpha_l, replacing
-the old pressure-projection method entirely. Stage 1 starts with the
-existing Lax-Friedrichs flux (kept below) before upgrading.
+NUMERICS (Change A): semi-discrete central-upwind flux
+(Kurganov-Noelle-Petrova) with minmod reconstruction (genuine 2nd-order
+accuracy) and the Kurganov-Petrova (2007) positivity correction on
+alpha_l, replacing the old pressure-projection method entirely. Wall and
+interfacial friction are integrated via linearized-implicit half-steps,
+Strang-split around the explicit SSP-RK2 transport step, since friction
+goes stiff as the liquid layer thins.
 
-STAGE STATUS: Stage 0 (steady algebraic Taitel-Dukler solver for the
-equilibrium holdup, used as a reference/validation target for the
-transient solver) is implemented below. Stages 1+ (the actual transient
-(alpha_l, Delta) solver) are not yet built -- see the design doc's
-"Stages and acceptance tests" checklist for what's next.
+STATUS: validated end-to-end against the independent steady Taitel-Dukler
+equilibrium solver below, and against all real stratified-wavy conditions
+in two literature datasets (Fan 2005, MDPI/Carraretto 2020) -- zero NaN,
+zero phase collapse, the exact regime that was 100% unusable on the old
+solver's PHI_COLLAPSE-bounded formulation.
 """
 
 import jax
@@ -52,99 +59,29 @@ import pickle
 import time
 
 # Force JAX to use 64-bit floats -- critical for numerical stability in PDEs,
-# and for the root-find/implicit-differentiation machinery in Stage 0 below.
+# and for the root-find/implicit-differentiation machinery below.
 jax.config.update("jax_enable_x64", True)
 
 # NOTE: equinox, optax, matplotlib, and the bb_to_model_inputs import were
 # dropped from the old solver's import list here -- they only supported code
 # (DragClosureNetwork, the training loop, validation plotting, B&B-to-
 # old-state-dict conversion) that was removed below as not applicable to
-# this reduced model. Re-add them when the corresponding later stage
-# actually needs them: eqx/optax once a learned f_i closure is built,
-# matplotlib for water-gas-specific validation plots, and a NEW (much
-# simpler) B&B/Fan-dataset-to-(U_sl, U_sg) converter once real data is fed
-# into the transient solver -- the old bb_to_model_inputs targeted the old
-# solver's initial_conditions()/time_step() signatures, which no longer
+# this reduced model. Re-add them when actually needed: eqx/optax once a
+# learned f_i closure is built (f_i_mult below is the hook point), matplotlib
+# for water-gas-specific validation plots, and a NEW (much simpler) real-
+# dataset-to-(U_sl, U_sg) converter -- the old bb_to_model_inputs targeted
+# the old solver's initial_conditions()/time_step() signatures, which don't
 # exist in this file.
 
-# =============================================================================
-# SECTION 1: GRID SETUP
-# =============================================================================
-# We use a finite volume method on a uniform 1D grid.
-# Each "cell" is a control volume of width dx.
-# Variables are stored at cell centers.
-# Fluxes are computed at cell faces (between centers).
-#
-#   |--dx--|--dx--|--dx--|
-#   |  0   |  1   |  2   |  ...  |  N-1  |   <- cell indices
-#   ^      ^      ^                        <- face indices (N+1 faces total)
-#   0      1      2                N
-#
-# Cell centers: x[i] = (i + 0.5) * dx
-# Faces:        x_face[i] = i * dx
-
-def make_grid(L, N):
-    """
-    Create a uniform 1D finite volume grid.
-
-    L : dimensionless pipe length, L* = L/D
-    N : int   — number of cells
-
-    Returns dx* (cell width) and x* (cell center coordinates), both
-    nondimensionalized by pipe diameter D (L_c = D is this project's
-    reference length scale, same convention as the oil-water solver).
-    """
-    dx = L / N
-    x  = (jnp.arange(N) + 0.5) * dx   # cell centers, shape (N,)
-    return dx, x
-
 
 # =============================================================================
-# SECTION 2: LAX-FRIEDRICHS FLUX (kept for Stage 1)
+# TAITEL-DUKLER EQUILIBRIUM SOLVER
+# Steady algebraic solver for the stratified equilibrium holdup, used as an
+# independent reference/validation target for the transient solver below.
 # =============================================================================
-# The Lax-Friedrichs scheme is the simplest stable numerical flux for
-# hyperbolic conservation laws like our mass and momentum equations.
-#
-# For a conservation law  ∂q/∂t + ∂F(q)/∂x = 0,
-# the Lax-Friedrichs numerical flux at face i+1/2 is:
-#
-#   F_{i+1/2} = 0.5*(F(q_i) + F(q_{i+1})) - 0.5*α*(q_{i+1} - q_i)
-#
-# where α = max wave speed (numerical dissipation coefficient).
-#
-# The first term is the average of left and right fluxes (central scheme).
-# The second term adds dissipation proportional to the jump in q — this
-# is what makes the scheme stable by damping oscillations at faces.
-#
-# Indexing: if q has shape (N,), the output has shape (N-1,) -- one flux
-# value per interior face.
-
-def lax_friedrichs_flux(F, q, alpha):
-    """
-    Compute Lax-Friedrichs numerical flux at all interior faces.
-
-    F     : (N,) physical flux at cell centers
-    q     : (N,) conserved variable at cell centers
-    alpha : scalar max wave speed for dissipation
-
-    Returns flux at N-1 interior faces, shape (N-1,).
-    
-    F[:-1] = left cell of each face (cell i)
-    F[1:]  = right cell of each face (cell i+1)
-    """
-    return 0.5 * (F[:-1] + F[1:]) - 0.5 * alpha * (q[1:] - q[:-1])
-
-
-# =============================================================================
-# WATER-GAS REDUCED MODEL -- STAGE 0
-# Steady algebraic Taitel-Dukler solver for stratified equilibrium holdup
-# =============================================================================
-# This section is self-contained and does NOT touch anything above it --
-# none of the existing (phi1, phi2, mom1, mom2) solver functions are
-# modified. It answers a different, narrower question first: given fixed
-# inlet superficial velocities U_sl (liquid) and U_sg (gas), what liquid
-# height h_l does a horizontal pipe settle into at steady, fully-developed
-# conditions?
+# Given fixed inlet superficial velocities U_sl (liquid) and U_sg (gas), what
+# liquid height h_l does a horizontal pipe settle into at steady, fully-
+# developed conditions?
 #
 # Derivation: each phase's OWN momentum balance, at steady/fully-developed
 # flow (no acceleration, nothing changing with x), is just a force balance:
@@ -158,8 +95,8 @@ def lax_friedrichs_flux(F, q, alpha):
 # h_l. Everything else (areas, perimeters, velocities, friction factors)
 # is a function of h_l once U_sl/U_sg are fixed. This is the classical
 # Taitel-Dukler (1976) combined-momentum equation; S_Delta(h_l) = 0 is the
-# equilibrium holdup this project's full transient PDE (Stage 1+) should
-# relax to if the per-cell closures are wired correctly.
+# equilibrium holdup the transient solver below should relax to if its
+# per-cell closures are wired correctly.
 # =============================================================================
 
 def td_geometry(ht, D):
@@ -175,13 +112,12 @@ def td_geometry(ht, D):
     clipped away from the exact endpoints because arccos's derivative
     blows up there -- a genuine geometric singularity (a perfectly empty
     or perfectly full pipe has no well-defined interface orientation),
-    not a numerical artifact. See the design doc's "keep ht strictly
-    inside (0,1)" note.
+    not a numerical artifact.
 
     Sanity check (worth keeping in mind while reading): at ht=0.5 (half
     full), s=0, arccos(0)=pi/2, so A_l = D^2/4*(pi - pi/2) = half the pipe
     area, and S_i = D -- a horizontal chord through a circle's center has
-    length exactly D. Both match the test below.
+    length exactly D.
     """
     ht_safe = jnp.clip(ht, 1e-6, 1.0 - 1e-6)
     s = 2.0 * ht_safe - 1.0
@@ -208,14 +144,21 @@ def fanning_wall_shear(u, rho, mu, D_h, Re_turb_cutoff=2100.0):
     anywhere, so it stays well-behaved (and differentiable) as u -> 0.
     Computing Re=rho*u*D_h/mu first (fine on its own) and then f=16/Re
     (blows up at u=0) before multiplying back by u would hit a 0*inf =
-    NaN at exactly u=0 despite the true limit being finite -- the "0/0"
-    the design doc flags.
+    NaN at exactly u=0 despite the true limit being finite.
 
     The turbulent branch (f=0.046*Re^-0.2) does still divide by Re.
     jnp.where evaluates BOTH branches to build the forward value (and,
     without care, both branches' gradients), so Re is floored away from
     0 before the power, even though the turbulent formula is only ever
     SELECTED once Re is safely above the cutoff.
+
+    NOTE (found during real-data validation, see run_real_data_condition
+    below): this cutoff is a genuine jump DISCONTINUITY -- the laminar and
+    turbulent formulas are not required to agree at Re=2100. A handful of
+    real conditions converge to a liquid Reynolds number sitting almost
+    exactly on top of this cutoff, where floating-point-level noise can
+    flip individual grid cells across it. That's a real, open limitation
+    of this closure, not something fixed here.
     """
     eps = 1e-12
     Re      = rho * jnp.abs(u) * D_h / mu
@@ -235,19 +178,19 @@ def stratified_momentum_source(A, A_l, A_g, S_l, S_g, S_i, u_l, u_g,
     ALREADY-COMPUTED geometry and velocities. Pure closure function --
     everything specific to "where did u_l/u_g come from" lives outside
     this function, in its two callers:
-      - taitel_dukler_residual (Stage 0): u_l=U_sl/alpha_l, u_g=U_sg/alpha_g
-        (the steady, uniform-flow special case).
-      - dynamic_source_Delta (Stage 1): u_l, u_g from recover_velocities,
-        evaluated locally at a real, possibly-transient (alpha_l, Delta).
+      - taitel_dukler_residual (steady equilibrium solver): u_l=U_sl/alpha_l,
+        u_g=U_sg/alpha_g (the steady, uniform-flow special case).
+      - dynamic_source_Delta (transient solver): u_l, u_g from
+        recover_velocities, evaluated locally at a real, possibly-
+        transient (alpha_l, Delta).
     Keeping this shared (rather than two copies that merely look similar)
-    is what makes "Stage 1 relaxes to Stage 0's equilibrium" a real check
-    of the TRANSIENT solver's correctness, not a comparison between two
-    independently-written, possibly-subtly-different closures.
+    is what makes "the transient solver relaxes to the steady equilibrium"
+    a real check of the TRANSIENT solver's correctness, not a comparison
+    between two independently-written, possibly-subtly-different closures.
 
     f_i_mult is a multiplicative knob on the interfacial shear, defaulting
     to 1.0 (unmodified smooth closure). It's the hook point for later
-    replacing the interfacial friction with a learned correction (the
-    "f_i is the quantity to learn later" item in the design doc) without
+    replacing the interfacial friction with a learned correction without
     touching this function's structure.
     """
     D_l = 4.0 * A_l / (S_l + 1e-12)
@@ -283,10 +226,10 @@ def taitel_dukler_residual(ht, U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g,
     """
     Horizontal (beta=0) steady combined-momentum residual S_Delta(ht).
     The root ht* where this is zero is the equilibrium stratified holdup
-    for the given superficial velocities -- see the module-level comment
-    block above for the derivation. Thin wrapper around
-    stratified_momentum_source -- see that function's docstring for the
-    closure details and why it's factored out this way.
+    for the given superficial velocities -- see the section banner above
+    for the derivation. Thin wrapper around stratified_momentum_source --
+    see that function's docstring for the closure details and why it's
+    factored out this way.
     """
     A, A_l, A_g, S_l, S_g, S_i = td_geometry(ht, D)
 
@@ -387,13 +330,10 @@ def _solve_taitel_dukler_holdup_jvp(primals, tangents):
 
 
 # =============================================================================
-# WATER-GAS REDUCED MODEL -- STAGE 1
-# Transient (alpha_l, Delta) solver: new state, velocity recovery, geometry
-# and stratified closures wired in, explicit sources, EXISTING Lax-Friedrichs
-# flux (local/central-upwind speeds are Stages 2-3, not here).
+# TRANSIENT STATE: geometry inversion, velocity recovery, flux, source
 # =============================================================================
-# State is now just two fields per cell: alpha_l (liquid volume fraction)
-# and Delta = rho_l*u_l - rho_g*u_g. Q = U_sl + U_sg (total superficial
+# State is just two fields per cell: alpha_l (liquid volume fraction) and
+# Delta = rho_l*u_l - rho_g*u_g. Q = U_sl + U_sg (total superficial
 # velocity) is NOT part of the state -- it's a single fixed scalar for the
 # whole run. That's not a simplifying assumption so much as a consequence
 # of incompressibility: add the liquid and gas mass equations together
@@ -414,12 +354,12 @@ def _newton_ht_from_alpha(alpha_l, D, n_iter=8):
     find ht = h_l/D such that A_l(ht)/A = alpha_l. Not meant to be
     differentiated through directly -- see h_l_of_alpha below, which wraps
     this with an implicit-function-theorem gradient instead (same pattern
-    as _bisect_ht / solve_taitel_dukler_holdup in Stage 0, except here we
-    use Newton rather than bisection, since this gets called once per
-    cell per timestep in the live solver and needs to be fast -- A_l(ht)
-    is smooth and strictly increasing over (0,1), so Newton from a
-    reasonable starting guess converges quadratically with no risk of the
-    sign-flip issues bisection is robust against but doesn't need here).
+    as _bisect_ht / solve_taitel_dukler_holdup above, except here we use
+    Newton rather than bisection, since this gets called once per cell per
+    timestep in the live solver and needs to be fast -- A_l(ht) is smooth
+    and strictly increasing over (0,1), so Newton from a reasonable
+    starting guess converges quadratically with no risk of the sign-flip
+    issues bisection is robust against but doesn't need here).
 
     ht0 = alpha_l is used as the starting guess -- exact at alpha_l =
     0, 0.5, 1 by the geometry's symmetry, and close enough elsewhere that
@@ -444,7 +384,7 @@ def h_l_of_alpha(alpha_l, D):
     dimensional height, in the same units as D).
 
     Differentiability, via the implicit function theorem (same idea as
-    Stage 0's solve_taitel_dukler_holdup, applied to a different, purely
+    solve_taitel_dukler_holdup above, applied to a different, purely
     geometric equation this time): define F(h_l, alpha_l) := A_l(h_l)/A -
     alpha_l = 0. This holds identically at the solution for any small
     change in alpha_l, so:
@@ -460,8 +400,7 @@ def h_l_of_alpha(alpha_l, D):
 
         dh_l/dalpha_l = A / S_i
 
-    exactly matching the design doc's stated formula. See
-    _h_l_of_alpha_jvp below for the (short) matching derivation of
+    See _h_l_of_alpha_jvp below for the (short) matching derivation of
     dh_l/dD, included for completeness since this function is decorated
     over both arguments.
     """
@@ -483,9 +422,9 @@ def _h_l_of_alpha_jvp(primals, tangents):
 
     # dh_l/dD = h_l/D: alpha_l is a pure SHAPE fraction (A_l(h_l,D)/A(D)
     # depends only on h_l/D, not on D and h_l separately -- rescaling the
-    # whole pipe doesn't change the fraction filled), so ht*(alpha_l)
-    # itself doesn't depend on D at all, and h_l = ht*D scales linearly
-    # with D at fixed alpha_l.
+    # whole pipe doesn't change the fraction filled), so ht(alpha_l) itself
+    # doesn't depend on D at all, and h_l = ht*D scales linearly with D at
+    # fixed alpha_l.
     dh_dD = h_l / (D + 1e-12)
 
     return h_l, dh_dalpha * dalpha_l + dh_dD * dD
@@ -520,8 +459,8 @@ def recover_velocities(alpha_l, Delta, Q, rho_l, rho_g):
 def physical_flux(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81):
     """
     Physical (non-dissipative) flux for the (alpha_l, Delta) system,
-    horizontal pipe (beta=0, matching Stage 0's scope -- the sin(beta)
-    source term and cos(beta) factor both drop out).
+    horizontal pipe (beta=0, matching the equilibrium solver's scope --
+    the sin(beta) source term and cos(beta) factor both drop out).
 
         flux_alpha = alpha_l*u_l
         flux_Delta = 0.5*rho_l*u_l**2 - 0.5*rho_g*u_g**2
@@ -532,10 +471,9 @@ def physical_flux(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81):
     alpha_l "want" to redistribute toward a level interface under gravity
     (denser liquid settling, lighter gas rising), the same mathematical
     role water depth plays in driving a shallow-water wave. That
-    structural match is why that paper's Stage 2-4 numerics (central-
-    upwind flux, local eigenvalues, positivity-preserving reconstruction)
-    are expected to carry over cleanly here, not just the Stage 0
-    velocity-desingularization idea.
+    structural match is why that paper's numerics (central-upwind flux,
+    local eigenvalues, positivity-preserving reconstruction) carry over
+    cleanly here, not just the velocity-desingularization idea above.
     """
     u_l, u_g = recover_velocities(alpha_l, Delta, Q, rho_l, rho_g)
     h_l = h_l_of_alpha(alpha_l, D)
@@ -549,10 +487,13 @@ def physical_flux(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81):
 def dynamic_source_Delta(alpha_l, Delta, Q, D, rho_l, rho_g, mu_l, mu_g,
                           f_i_mult=1.0):
     """
-    S_Delta evaluated at a real, local (possibly transient) state --
-    the Stage 1 counterpart of Stage 0's taitel_dukler_residual, sharing
-    the same stratified_momentum_source closure (see that function's
-    docstring for why this matters for the Stage 1 acceptance test).
+    S_Delta evaluated at a real, local (possibly transient) state -- the
+    transient counterpart of taitel_dukler_residual's steady equation,
+    sharing the same stratified_momentum_source closure (see that
+    function's docstring for why this matters -- it's what makes "the
+    transient solver relaxes to the steady equilibrium" a real check of
+    correctness, not a comparison between two independently-written
+    closures).
     """
     ht = _newton_ht_from_alpha(alpha_l, D)
     A, A_l, A_g, S_l, S_g, S_i = td_geometry(ht, D)
@@ -577,97 +518,16 @@ def init_state_water_gas(N, U_sl, U_sg, rho_l, rho_g):
     return {'alpha_l': alpha_l, 'Delta': Delta}
 
 
-def advance_state_stage1(state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
-                          alpha_l_inlet, Delta_inlet, g=9.81, f_i_mult=1.0):
-    """
-    One explicit forward-Euler step. Stage 1 deliberately keeps the
-    existing Lax-Friedrichs flux with a single global dissipation speed
-    (same pattern as the old solver) -- local/central-upwind speeds are
-    Stage 2/3. Source term is explicit (Stage 5 makes it implicit, needed
-    once the liquid layer gets thin enough for the friction source to get
-    stiff). Boundary conditions: fixed (Dirichlet) inlet, zero-gradient
-    outlet -- same convention the old solver used.
-    """
-    alpha_l = state['alpha_l']
-    Delta   = state['Delta']
-
-    flux_alpha, flux_Delta = physical_flux(alpha_l, Delta, Q, D, rho_l, rho_g, g)
-
-    u_l, u_g = recover_velocities(alpha_l, Delta, Q, rho_l, rho_g)
-    lf_speed = jnp.maximum(jnp.max(jnp.abs(u_l)), jnp.max(jnp.abs(u_g)))
-    lf_speed = jnp.maximum(lf_speed, 1e-6)
-
-    f_alpha_face = lax_friedrichs_flux(flux_alpha, alpha_l, lf_speed)
-    f_Delta_face = lax_friedrichs_flux(flux_Delta, Delta, lf_speed)
-
-    div_alpha = (f_alpha_face[1:] - f_alpha_face[:-1]) / dx
-    div_Delta = (f_Delta_face[1:] - f_Delta_face[:-1]) / dx
-
-    S_Delta = dynamic_source_Delta(alpha_l[1:-1], Delta[1:-1], Q, D,
-                                    rho_l, rho_g, mu_l, mu_g, f_i_mult)
-
-    alpha_l_new_int = alpha_l[1:-1] - dt * div_alpha
-    Delta_new_int   = Delta[1:-1]   - dt * div_Delta + dt * S_Delta
-
-    # Physical bound on alpha_l -- same role as the old solver's
-    # clip+renormalize on phi1/phi2, but simpler: alpha_g = 1-alpha_l is
-    # never independently evolved here, so a plain clip is sufficient.
-    alpha_l_new_int = jnp.clip(alpha_l_new_int, 1e-6, 1.0 - 1e-6)
-
-    alpha_l_full = jnp.concatenate([
-        jnp.array([alpha_l_inlet]), alpha_l_new_int, alpha_l_new_int[-1:]
-    ])
-    Delta_full = jnp.concatenate([
-        jnp.array([Delta_inlet]), Delta_new_int, Delta_new_int[-1:]
-    ])
-
-    return {'alpha_l': alpha_l_full, 'Delta': Delta_full}
-
-
-def run_stage1_to_steady(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N,
-                          dt, n_steps, g=9.81, f_i_mult=1.0):
-    """
-    Run the Stage 1 transient solver from the no-slip initial condition
-    for n_steps of size dt, via jax.lax.scan (same time-loop pattern used
-    throughout this project). Returns the final state.
-    """
-    Q = U_sl + U_sg
-    alpha_l_inlet = U_sl / Q
-    Delta_inlet   = (rho_l - rho_g) * Q
-    dx = L / N
-
-    state = init_state_water_gas(N, U_sl, U_sg, rho_l, rho_g)
-
-    def step(state, _):
-        new_state = advance_state_stage1(
-            state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
-            alpha_l_inlet, Delta_inlet, g, f_i_mult
-        )
-        return new_state, None
-
-    final_state, _ = jax.lax.scan(step, state, None, length=n_steps)
-    return final_state
-
-
 # =============================================================================
-# WATER-GAS REDUCED MODEL -- STAGE 2 (in progress)
-# Local characteristic speeds, replacing Stage 1's single global LF speed.
+# CHARACTERISTIC SPEEDS (flux-Jacobian eigenvalues)
 # =============================================================================
-# Stage 1's advance_state_stage1 uses ONE number (max(|u_l|,|u_g|) over the
-# WHOLE domain) to set the numerical dissipation everywhere, every face --
-# the standard global Lax-Friedrichs choice, simple but wasteful: a face
-# where the flow is locally slow and smooth gets exactly as much numerical
-# smoothing as the single fastest point anywhere else in the domain.
-#
 # The real, local answer to "how fast is information actually moving
-# through THIS point" is the eigenvalues of the flux Jacobian dF/dU --
-# not u_l or u_g directly, but the actual characteristic speeds of the
+# through THIS point" is the eigenvalues of the flux Jacobian dF/dU -- not
+# u_l or u_g directly, but the actual characteristic speeds of the
 # (alpha_l, Delta) system, which (by the Saint-Venant analogy established
-# earlier -- the h_l(alpha_l) term playing the role of g*h) are expected
-# to look like "velocity plus/minus a gravity-wave correction", the same
-# structural shape as shallow water's u +/- sqrt(g*h) -- not identical to
-# u_l/u_g, but the same order of magnitude, which is one of the sanity
-# checks run below.
+# above -- the h_l(alpha_l) term playing the role of g*h) look like
+# "velocity plus/minus a gravity-wave correction", the same structural
+# shape as shallow water's u +/- sqrt(g*h).
 
 def local_wave_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81):
     """
@@ -723,134 +583,25 @@ def local_wave_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81):
     return lam1, lam2, is_complex
 
 
-def rusanov_face_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81):
-    """
-    Per-face Rusanov dissipation speed, replacing Stage 1's single
-    domain-wide max(|u_l|,|u_g|). For each face (between cell i and
-    cell i+1), take the largest eigenvalue magnitude found on EITHER
-    neighboring cell -- the standard Rusanov choice, and the minimum
-    needed for stability: a face's dissipation has to be at least as
-    large as the fastest wave actually present on either side of it, but
-    no larger than that (unlike Stage 1, which used the fastest wave
-    ANYWHERE in the whole domain for every single face).
-
-    Also returns face_is_complex (True if either neighboring cell was
-    individually KH-flagged by local_wave_speeds) -- per-face so it's
-    ready to be summed into a KH-flagged-face count later (see the design
-    doc's "After the run" diagnostics), not used for anything else here.
-    """
-    lam1, lam2, is_complex = local_wave_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g)
-    max_speed_per_cell = jnp.maximum(jnp.abs(lam1), jnp.abs(lam2))
-
-    face_speed      = jnp.maximum(max_speed_per_cell[:-1], max_speed_per_cell[1:])
-    face_is_complex = is_complex[:-1] | is_complex[1:]
-
-    return face_speed, face_is_complex
-
-
-def advance_state_stage2(state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
-                          alpha_l_inlet, Delta_inlet, g=9.81, f_i_mult=1.0):
-    """
-    Stage 2: identical to advance_state_stage1 EXCEPT the single global
-    lf_speed is replaced by rusanov_face_speeds' per-face array. Kept as
-    a separate function (not an edit to advance_state_stage1) so Stage 1
-    and Stage 2 stay directly comparable on the same test conditions,
-    same spirit as this project's past practice of keeping comparable
-    variants in separate functions/checkpoints rather than overwriting.
-
-    One side effect worth flagging explicitly: this also removes the
-    separate recover_velocities(...) call Stage 1 used JUST to get
-    lf_speed -- rusanov_face_speeds gets its own velocity information
-    indirectly, through physical_flux inside local_wave_speeds' jacfwd.
-    That's one fewer of the three redundant recover_velocities calls per
-    timestep flagged earlier (physical_flux's own call and
-    dynamic_source_Delta's own call are both still there, unchanged).
-    """
-    alpha_l = state['alpha_l']
-    Delta   = state['Delta']
-
-    flux_alpha, flux_Delta = physical_flux(alpha_l, Delta, Q, D, rho_l, rho_g, g)
-
-    face_speed, face_is_complex = rusanov_face_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g)
-    face_speed = jnp.maximum(face_speed, 1e-6)   # same floor Stage 1 used
-
-    f_alpha_face = lax_friedrichs_flux(flux_alpha, alpha_l, face_speed)
-    f_Delta_face = lax_friedrichs_flux(flux_Delta, Delta, face_speed)
-
-    div_alpha = (f_alpha_face[1:] - f_alpha_face[:-1]) / dx
-    div_Delta = (f_Delta_face[1:] - f_Delta_face[:-1]) / dx
-
-    S_Delta = dynamic_source_Delta(alpha_l[1:-1], Delta[1:-1], Q, D,
-                                    rho_l, rho_g, mu_l, mu_g, f_i_mult)
-
-    alpha_l_new_int = alpha_l[1:-1] - dt * div_alpha
-    Delta_new_int   = Delta[1:-1]   - dt * div_Delta + dt * S_Delta
-
-    alpha_l_new_int = jnp.clip(alpha_l_new_int, 1e-6, 1.0 - 1e-6)
-
-    alpha_l_full = jnp.concatenate([
-        jnp.array([alpha_l_inlet]), alpha_l_new_int, alpha_l_new_int[-1:]
-    ])
-    Delta_full = jnp.concatenate([
-        jnp.array([Delta_inlet]), Delta_new_int, Delta_new_int[-1:]
-    ])
-
-    n_kh_faces = jnp.sum(face_is_complex)
-
-    return {'alpha_l': alpha_l_full, 'Delta': Delta_full}, n_kh_faces
-
-
-def run_stage2_to_steady(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N,
-                          dt, n_steps, g=9.81, f_i_mult=1.0):
-    """
-    Stage 2 counterpart of run_stage1_to_steady -- same structure, same
-    initial/boundary conditions, only the per-step flux call differs.
-    Also accumulates the total count of KH-flagged face-steps across the
-    whole run, as a first, minimal version of the diagnostic the design
-    doc's "After the run" section calls for.
-    """
-    Q = U_sl + U_sg
-    alpha_l_inlet = U_sl / Q
-    Delta_inlet   = (rho_l - rho_g) * Q
-    dx = L / N
-
-    state = init_state_water_gas(N, U_sl, U_sg, rho_l, rho_g)
-
-    def step(carry, _):
-        state, kh_total = carry
-        new_state, n_kh_faces = advance_state_stage2(
-            state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
-            alpha_l_inlet, Delta_inlet, g, f_i_mult
-        )
-        return (new_state, kh_total + n_kh_faces), None
-
-    (final_state, kh_total), _ = jax.lax.scan(
-        step, (state, jnp.array(0)), None, length=n_steps
-    )
-    return final_state, kh_total
-
-
 # =============================================================================
-# WATER-GAS REDUCED MODEL -- STAGE 3
-# Central-upwind flux, replacing Stage 2's symmetric Rusanov speed.
+# CENTRAL-UPWIND NUMERICAL FLUX
 # =============================================================================
-# Rusanov (Stage 2) applies the SAME dissipation in both directions at a
-# face, sized by whichever of the two local eigenvalue magnitudes is
-# larger. Central-upwind instead treats rightward- and leftward-moving
-# information separately: a_plus (how fast is anything actually moving
-# right here, floored at 0) and a_minus (how fast is anything moving
-# left, capped at 0) are computed independently, so a face with little
-# or no leftward-propagating information gets little or no leftward
-# dissipation, instead of inheriting Rusanov's single blanket damping
-# whichever direction the fastest wave happens to point.
+# Central-upwind treats rightward- and leftward-moving information
+# separately: a_plus (how fast is anything actually moving right here,
+# floored at 0) and a_minus (how fast is anything moving left, capped at
+# 0) are computed independently, so a face with little or no leftward-
+# propagating information gets little or no leftward dissipation, instead
+# of a single symmetric (Rusanov/Lax-Friedrichs-style) blanket damping
+# sized by whichever direction's wave happens to be fastest.
 
 def central_upwind_face_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81):
     """
     Per-face one-sided speeds for the central-upwind flux, from the same
     per-cell eigenvalues local_wave_speeds already computes (lam1 <= lam2
-    by construction -- see that function). Still first-order in space
-    (Stage 4 adds reconstruction): "left"/"right" at a face means the two
-    neighboring cells' own centers, same as Stage 1/2.
+    by construction -- see that function). "left"/"right" at a face here
+    means whichever two states border it -- either the two neighboring
+    cells' own centers (first-order) or, in advance_state below, their
+    reconstructed sub-cell face values (second-order).
 
         a_plus  = max(lam2_L, lam2_R, 0)   -- fastest RIGHTWARD speed, >= 0
         a_minus = min(lam1_L, lam1_R, 0)   -- fastest LEFTWARD speed, <= 0
@@ -876,101 +627,29 @@ def central_upwind_flux(F_L, F_R, U_L, U_R, a_plus, a_minus):
     degenerate case where every relevant eigenvalue on both sides is
     exactly zero. Floor it directly rather than computing the division
     and selecting it away with jnp.where afterward -- same "make the
-    denominator safe BEFORE dividing" reasoning the design doc flags
-    and fanning_wall_shear already follows for its turbulent branch.
+    denominator safe BEFORE dividing" reasoning fanning_wall_shear
+    already follows for its turbulent branch.
 
-    Sanity check worth knowing (verified numerically below before this
-    was trusted): forcing a_plus = -a_minus = a collapses this exactly
-    to Lax-Friedrichs with speed a -- 0.5*(F_L+F_R) - 0.5*a*(U_R-U_L).
-    Central-upwind is a strict generalization of what Stage 1/2 were
-    already doing, not a different family of scheme.
+    Sanity check worth knowing (verified numerically before this was
+    trusted): forcing a_plus = -a_minus = a collapses this exactly to
+    Lax-Friedrichs with speed a -- 0.5*(F_L+F_R) - 0.5*a*(U_R-U_L).
+    Central-upwind is a strict generalization of a plain Lax-Friedrichs/
+    Rusanov flux, not a different family of scheme.
     """
     denom = jnp.maximum(a_plus - a_minus, 1e-10)
     return (a_plus * F_L - a_minus * F_R) / denom + (a_plus * a_minus / denom) * (U_R - U_L)
 
 
-def advance_state_stage3(state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
-                          alpha_l_inlet, Delta_inlet, g=9.81, f_i_mult=1.0):
-    """
-    Stage 3: identical to advance_state_stage2 except the numerical flux
-    is built from central_upwind_flux (asymmetric a_plus/a_minus) instead
-    of lax_friedrichs_flux (symmetric Rusanov speed). Kept as its own
-    function so Stage 1/2/3 stay directly comparable on the same test
-    conditions.
-    """
-    alpha_l = state['alpha_l']
-    Delta   = state['Delta']
-
-    flux_alpha, flux_Delta = physical_flux(alpha_l, Delta, Q, D, rho_l, rho_g, g)
-
-    a_plus, a_minus, face_is_complex = central_upwind_face_speeds(
-        alpha_l, Delta, Q, D, rho_l, rho_g, g
-    )
-
-    f_alpha_face = central_upwind_flux(flux_alpha[:-1], flux_alpha[1:],
-                                        alpha_l[:-1], alpha_l[1:], a_plus, a_minus)
-    f_Delta_face = central_upwind_flux(flux_Delta[:-1], flux_Delta[1:],
-                                        Delta[:-1], Delta[1:], a_plus, a_minus)
-
-    div_alpha = (f_alpha_face[1:] - f_alpha_face[:-1]) / dx
-    div_Delta = (f_Delta_face[1:] - f_Delta_face[:-1]) / dx
-
-    S_Delta = dynamic_source_Delta(alpha_l[1:-1], Delta[1:-1], Q, D,
-                                    rho_l, rho_g, mu_l, mu_g, f_i_mult)
-
-    alpha_l_new_int = alpha_l[1:-1] - dt * div_alpha
-    Delta_new_int   = Delta[1:-1]   - dt * div_Delta + dt * S_Delta
-
-    alpha_l_new_int = jnp.clip(alpha_l_new_int, 1e-6, 1.0 - 1e-6)
-
-    alpha_l_full = jnp.concatenate([
-        jnp.array([alpha_l_inlet]), alpha_l_new_int, alpha_l_new_int[-1:]
-    ])
-    Delta_full = jnp.concatenate([
-        jnp.array([Delta_inlet]), Delta_new_int, Delta_new_int[-1:]
-    ])
-
-    n_kh_faces = jnp.sum(face_is_complex)
-
-    return {'alpha_l': alpha_l_full, 'Delta': Delta_full}, n_kh_faces
-
-
-def run_stage3_to_steady(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N,
-                          dt, n_steps, g=9.81, f_i_mult=1.0):
-    """Stage 3 counterpart of run_stage2_to_steady."""
-    Q = U_sl + U_sg
-    alpha_l_inlet = U_sl / Q
-    Delta_inlet   = (rho_l - rho_g) * Q
-    dx = L / N
-
-    state = init_state_water_gas(N, U_sl, U_sg, rho_l, rho_g)
-
-    def step(carry, _):
-        state, kh_total = carry
-        new_state, n_kh_faces = advance_state_stage3(
-            state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
-            alpha_l_inlet, Delta_inlet, g, f_i_mult
-        )
-        return (new_state, kh_total + n_kh_faces), None
-
-    (final_state, kh_total), _ = jax.lax.scan(
-        step, (state, jnp.array(0)), None, length=n_steps
-    )
-    return final_state, kh_total
-
-
 # =============================================================================
-# WATER-GAS REDUCED MODEL -- STAGE 4
-# Minmod reconstruction + Kurganov-Petrova positivity-preserving correction.
+# RECONSTRUCTION (minmod/MUSCL) + POSITIVITY-PRESERVING CORRECTION
 # =============================================================================
-# Stages 1-3 all feed the flux raw cell-center values directly -- the
-# hallmark of a first-order scheme: a face's left/right states are just
-# "whatever the two neighboring cells' own averages happen to be," with
-# no attempt to estimate what the solution is actually doing WITHIN each
-# cell. Reconstruction replaces that with a per-cell linear profile
-# (slope from minmod), so the flux instead sees values extrapolated to
-# the actual face location -- the source of the jump from first-order to
-# second-order accuracy.
+# A first-order scheme feeds the flux raw cell-center values directly --
+# a face's left/right states are just "whatever the two neighboring
+# cells' own averages happen to be," with no attempt to estimate what the
+# solution is actually doing WITHIN each cell. Reconstruction replaces
+# that with a per-cell linear profile (slope from minmod), so the flux
+# instead sees values extrapolated to the actual face location -- the
+# source of the jump from first-order to second-order accuracy.
 
 def minmod3(z1, z2, z3):
     """
@@ -981,8 +660,9 @@ def minmod3(z1, z2, z3):
     through when three independent local difference estimates all agree
     on direction -- near a kink or discontinuity they won't, and the
     slope gets forced to zero (falling back to the same flat, first-
-    order cell-center value Stages 1-3 always used) rather than risk
-    extrapolating past a real extremum into an overshoot.
+    order cell-center value a plain first-order scheme would use)
+    rather than risk extrapolating past a real extremum into an
+    overshoot.
     """
     all_pos = (z1 > 0) & (z2 > 0) & (z3 > 0)
     all_neg = (z1 < 0) & (z2 < 0) & (z3 < 0)
@@ -1080,131 +760,32 @@ def positivity_correct(U_center, left_face, right_face, lo=0.0, hi=1.0):
     return lf, rf
 
 
-def advance_state_stage4(state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
-                          alpha_l_inlet, Delta_inlet, g=9.81, f_i_mult=1.0,
-                          theta=1.3):
-    """
-    Stage 4: reconstruction + positivity correction, feeding genuinely
-    different left/right states into central_upwind_flux at each face,
-    instead of Stage 1-3's single shared cell-center value.
-
-    Boundary cells (index 0 and N-1) have no slope of their own (a slope
-    needs both neighbors) -- they contribute their raw, unreconstructed
-    value to whichever face they border, same spirit as a ghost cell
-    carrying no gradient information. Built via concatenation: each of
-    the N-1 faces gets a "left state" (the bordering cell's own
-    right-edge value) and "right state" (the bordering cell's own
-    left-edge value) -- boundary cells supply their raw value at the
-    domain's two end faces, interior cells supply their (positivity-
-    corrected, for alpha_l) reconstructed value everywhere else.
-    """
-    alpha_l = state['alpha_l']
-    Delta   = state['Delta']
-
-    alpha_lf_raw, alpha_rf_raw = reconstruct_faces(alpha_l, dx, theta)
-    Delta_lf, Delta_rf         = reconstruct_faces(Delta, dx, theta)
-
-    alpha_center = alpha_l[1:-1]
-    alpha_lf, alpha_rf = positivity_correct(alpha_center, alpha_lf_raw, alpha_rf_raw)
-
-    # Assemble the two states bordering each of the N-1 faces.
-    alpha_L = jnp.concatenate([alpha_l[0:1], alpha_rf])   # shape (N-1,)
-    alpha_R = jnp.concatenate([alpha_lf, alpha_l[-1:]])
-    Delta_L = jnp.concatenate([Delta[0:1], Delta_rf])
-    Delta_R = jnp.concatenate([Delta_lf, Delta[-1:]])
-
-    F_alpha_L, F_Delta_L = physical_flux(alpha_L, Delta_L, Q, D, rho_l, rho_g, g)
-    F_alpha_R, F_Delta_R = physical_flux(alpha_R, Delta_R, Q, D, rho_l, rho_g, g)
-
-    # Local speeds evaluated AT the reconstructed face states themselves
-    # (per the design doc's step 11 -- "on both sides"), not at the
-    # neighboring cells' own centers the way Stage 2/3 did.
-    lam1_L, lam2_L, is_complex_L = local_wave_speeds(alpha_L, Delta_L, Q, D, rho_l, rho_g, g)
-    lam1_R, lam2_R, is_complex_R = local_wave_speeds(alpha_R, Delta_R, Q, D, rho_l, rho_g, g)
-
-    a_plus  = jnp.maximum(jnp.maximum(lam2_L, lam2_R), 0.0)
-    a_minus = jnp.minimum(jnp.minimum(lam1_L, lam1_R), 0.0)
-    face_is_complex = is_complex_L | is_complex_R
-
-    f_alpha_face = central_upwind_flux(F_alpha_L, F_alpha_R, alpha_L, alpha_R, a_plus, a_minus)
-    f_Delta_face = central_upwind_flux(F_Delta_L, F_Delta_R, Delta_L, Delta_R, a_plus, a_minus)
-
-    div_alpha = (f_alpha_face[1:] - f_alpha_face[:-1]) / dx
-    div_Delta = (f_Delta_face[1:] - f_Delta_face[:-1]) / dx
-
-    S_Delta = dynamic_source_Delta(alpha_l[1:-1], Delta[1:-1], Q, D,
-                                    rho_l, rho_g, mu_l, mu_g, f_i_mult)
-
-    alpha_l_new_int = alpha_l[1:-1] - dt * div_alpha
-    Delta_new_int   = Delta[1:-1]   - dt * div_Delta + dt * S_Delta
-
-    # Still clipped as a final defensive floor, but the positivity
-    # correction above should mean this rarely/never actually fires --
-    # that's exactly what the near-dry test below checks directly.
-    alpha_l_new_int = jnp.clip(alpha_l_new_int, 1e-6, 1.0 - 1e-6)
-
-    alpha_l_full = jnp.concatenate([
-        jnp.array([alpha_l_inlet]), alpha_l_new_int, alpha_l_new_int[-1:]
-    ])
-    Delta_full = jnp.concatenate([
-        jnp.array([Delta_inlet]), Delta_new_int, Delta_new_int[-1:]
-    ])
-
-    n_kh_faces = jnp.sum(face_is_complex)
-
-    return {'alpha_l': alpha_l_full, 'Delta': Delta_full}, n_kh_faces, f_alpha_face
-
-
-def run_stage4_to_steady(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N,
-                          dt, n_steps, g=9.81, f_i_mult=1.0, theta=1.3):
-    """Stage 4 counterpart of run_stage3_to_steady."""
-    Q = U_sl + U_sg
-    alpha_l_inlet = U_sl / Q
-    Delta_inlet   = (rho_l - rho_g) * Q
-    dx = L / N
-
-    state = init_state_water_gas(N, U_sl, U_sg, rho_l, rho_g)
-
-    def step(carry, _):
-        state, kh_total = carry
-        new_state, n_kh_faces, _ = advance_state_stage4(
-            state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
-            alpha_l_inlet, Delta_inlet, g, f_i_mult, theta
-        )
-        return (new_state, kh_total + n_kh_faces), None
-
-    (final_state, kh_total), _ = jax.lax.scan(
-        step, (state, jnp.array(0)), None, length=n_steps
-    )
-    return final_state, kh_total
-
-
 # =============================================================================
-# WATER-GAS REDUCED MODEL -- STAGE 5
-# Implicit friction + Strang splitting.
+# IMPLICIT FRICTION (STRANG SPLITTING) + FULL TIMESTEP
 # =============================================================================
-# Stages 1-4 all added the friction source term EXPLICITLY, in the same
-# single update as the flux divergence: Delta += dt*(-div_Delta + S_Delta).
-# That's fine as long as S_Delta stays modest, but it gets genuinely stiff
-# as the liquid layer thins (A_l -> 0 drives tau_wl*S_l/A_l -> infinity) --
-# an explicit step can then overshoot the true (rapidly-relaxing)
-# equilibrium instead of tracking it, unless dt shrinks to match. Stage 5
-# splits the timestep into three parts -- implicit friction half-step,
-# explicit transport full-step, implicit friction half-step (Strang
-# splitting) -- so friction gets a treatment that's stable for any dt,
-# while the flux divergence (which ISN'T stiff) keeps using the accurate
-# explicit central-upwind scheme from Stage 3/4 unchanged.
+# A simpler scheme would add the friction source term EXPLICITLY, in the
+# same single update as the flux divergence: Delta += dt*(-div_Delta +
+# S_Delta). That's fine as long as S_Delta stays modest, but it gets
+# genuinely stiff as the liquid layer thins (A_l -> 0 drives
+# tau_wl*S_l/A_l -> infinity) -- an explicit step can then overshoot the
+# true (rapidly-relaxing) equilibrium instead of tracking it, unless dt
+# shrinks to match. The timestep below is instead split into three parts
+# -- implicit friction half-step, explicit transport full-step, implicit
+# friction half-step (Strang splitting) -- so friction gets a treatment
+# that's stable for any dt, while the flux divergence (which ISN'T
+# stiff) keeps using the accurate explicit central-upwind scheme
+# unchanged.
 
 def _implicit_friction_half_step(alpha_l_int, Delta_int, Q, D, rho_l, rho_g,
                                   mu_l, mu_g, dt_half, f_i_mult=1.0):
     """
     Linearized-implicit half-step on Delta ONLY -- alpha_l and Q are
     frozen (per the design doc: "In each cell, alpha_l and Q are frozen;
-    only Delta changes"). See the derivation in the conceptual walkthrough
-    above: this is a single algebraic solve of backward Euler linearized
-    around the current Delta, not an iterative Newton solve -- exact for
-    this one linearization, which is what makes it cheap enough to run
-    twice (half-step before and after transport) every single timestep.
+    only Delta changes"). This is a single algebraic solve of backward
+    Euler linearized around the current Delta, not an iterative Newton
+    solve -- exact for this one linearization, which is what makes it
+    cheap enough to run twice (half-step before and after transport)
+    every single timestep.
 
     dynamic_source_Delta is already purely elementwise (no cross-cell
     coupling -- confirmed when it was built, see the local_wave_speeds/
@@ -1223,12 +804,25 @@ def _implicit_friction_half_step(alpha_l_int, Delta_int, Q, D, rho_l, rho_g,
 def _transport_only_step(state, dt, dx, Q, D, rho_l, rho_g,
                           alpha_l_inlet, Delta_inlet, g=9.81, theta=1.3):
     """
-    Stage 4's reconstruction + positivity correction + central-upwind
-    flux update, WITH THE SOURCE TERM REMOVED -- friction is handled
-    entirely by the implicit half-steps bookending this in
-    advance_state_stage5. This is "Part 2" of the Strang split, called
+    The reconstruction + positivity correction + central-upwind flux
+    update used throughout this file, WITH THE SOURCE TERM REMOVED --
+    friction is handled entirely by the implicit half-steps bookending
+    this in advance_state. This is "Part 2" of the Strang split, called
     TWICE per full timestep (SSP-RK2 needs two forward-Euler-like
     stages) -- see _ssp_rk2_transport below.
+
+    Boundary cells (index 0 and N-1) have no slope of their own (a slope
+    needs both neighbors) -- they contribute their raw, unreconstructed
+    value to whichever face they border, same spirit as a ghost cell
+    carrying no gradient information.
+
+    NO defensive clip on alpha_l here -- positivity_correct above is
+    relied on to keep the UPDATED cell average in [0,1] by construction
+    (Kurganov & Petrova 2007's positivity-preserving property), not
+    patched after the fact. Confirmed safe by the real-data validation
+    below, down to alpha_l ~ 5e-5 (Fan 2005's thinnest liquid-loading
+    conditions) -- a leftover PHI_COLLAPSE-style clip was removed from an
+    earlier version of this function once that held up.
     """
     alpha_l = state['alpha_l']
     Delta   = state['Delta']
@@ -1247,6 +841,8 @@ def _transport_only_step(state, dt, dx, Q, D, rho_l, rho_g,
     F_alpha_L, F_Delta_L = physical_flux(alpha_L, Delta_L, Q, D, rho_l, rho_g, g)
     F_alpha_R, F_Delta_R = physical_flux(alpha_R, Delta_R, Q, D, rho_l, rho_g, g)
 
+    # Local speeds evaluated AT the reconstructed face states themselves,
+    # not at the neighboring cells' own centers.
     lam1_L, lam2_L, is_complex_L = local_wave_speeds(alpha_L, Delta_L, Q, D, rho_l, rho_g, g)
     lam1_R, lam2_R, is_complex_R = local_wave_speeds(alpha_R, Delta_R, Q, D, rho_l, rho_g, g)
 
@@ -1262,14 +858,6 @@ def _transport_only_step(state, dt, dx, Q, D, rho_l, rho_g,
 
     alpha_l_new_int = alpha_l[1:-1] - dt * div_alpha
     Delta_new_int   = Delta[1:-1]   - dt * div_Delta   # no source term -- that's the whole point
-
-    # NO defensive clip here (Stage 6 removes the old-style threshold) --
-    # positivity_correct above is relied on to keep the UPDATED cell
-    # average in [0,1] by construction (Kurganov & Petrova 2007's
-    # positivity-preserving property), not patched after the fact. See
-    # the Stage 6 section banner below for why this is trusted rather than
-    # just hoped, and the real-data run that stress-tests it down to
-    # alpha_l ~ 5e-5 (Fan 2005's thinnest liquid-loading conditions).
 
     alpha_l_full = jnp.concatenate([
         jnp.array([alpha_l_inlet]), alpha_l_new_int, alpha_l_new_int[-1:]
@@ -1299,17 +887,16 @@ def _ssp_rk2_transport(state, dt, dx, Q, D, rho_l, rho_g,
     return new_state, kh1 + kh2
 
 
-def advance_state_stage5(state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
-                          alpha_l_inlet, Delta_inlet, g=9.81, f_i_mult=1.0,
-                          theta=1.3):
+def advance_state(state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
+                   alpha_l_inlet, Delta_inlet, g=9.81, f_i_mult=1.0,
+                   theta=1.3):
     """
     Full Strang-split timestep: implicit friction half-step (dt/2) ->
     explicit SSP-RK2 transport full-step (dt) -> implicit friction
     half-step (dt/2). alpha_l is untouched by the friction half-steps
     (only Delta evolves there); boundary cells (index 0, N-1) are left to
-    the fixed inlet/zero-gradient treatment throughout, same as every
-    earlier stage -- friction is only ever evaluated on genuine interior
-    cells.
+    the fixed inlet/zero-gradient treatment throughout -- friction is
+    only ever evaluated on genuine interior cells.
     """
     alpha_l = state['alpha_l']
     Delta   = state['Delta']
@@ -1336,9 +923,13 @@ def advance_state_stage5(state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
     return {'alpha_l': alpha_l_2, 'Delta': Delta_final}, n_kh
 
 
-def run_stage5_to_steady(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N,
-                          dt, n_steps, g=9.81, f_i_mult=1.0, theta=1.3):
-    """Stage 5 counterpart of run_stage4_to_steady."""
+def run_to_steady(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N,
+                   dt, n_steps, g=9.81, f_i_mult=1.0, theta=1.3):
+    """
+    Run the full solver (advance_state) from the no-slip initial condition
+    for n_steps of size dt, via jax.lax.scan. Returns the final state and
+    the total KH-flagged-face-step count accumulated over the run.
+    """
     Q = U_sl + U_sg
     alpha_l_inlet = U_sl / Q
     Delta_inlet   = (rho_l - rho_g) * Q
@@ -1348,7 +939,7 @@ def run_stage5_to_steady(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N,
 
     def step(carry, _):
         state, kh_total = carry
-        new_state, n_kh_faces = advance_state_stage5(
+        new_state, n_kh_faces = advance_state(
             state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
             alpha_l_inlet, Delta_inlet, g, f_i_mult, theta
         )
@@ -1361,27 +952,17 @@ def run_stage5_to_steady(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N,
 
 
 # =============================================================================
-# WATER-GAS REDUCED MODEL -- STAGE 6
-# Remove the old-style threshold; validate against real stratified-wavy data.
+# REAL-DATA VALIDATION DIAGNOSTICS
 # =============================================================================
-# Two separate things happen in this stage:
-#   (1) The defensive jnp.clip on alpha_l that every earlier stage carried
-#       (a leftover habit from the old solver's PHI_COLLAPSE-style safety
-#       net) has been REMOVED from _transport_only_step above -- the only
-#       place in the live Stage 5 pipeline that actually updates alpha_l's
-#       cell average. We now rely entirely on positivity_correct (Stage 4)
-#       to keep alpha_l in [0,1] by construction, not a clip that patches
-#       it after the fact. That claim is only trustworthy if it survives
-#       real low-liquid-holdup data, not just the conditions already tried.
-#   (2) Run the finished Stage 0-5 solver against two real stratified-wavy
-#       gas-liquid datasets (Fan 2005, MDPI/Carraretto 2020) that motivated
-#       this whole rewrite -- see the module docstring's problem #1 and #3.
-#       Compare predicted equilibrium holdup and pressure gradient against
-#       measured values, and log KH-flag counts per condition.
+# Validates the solver above against two real stratified-wavy gas-liquid
+# datasets (Fan 2005, MDPI/Carraretto 2020) that motivated this whole
+# rewrite -- see the module docstring's problem #1 and #3. Reports
+# predicted equilibrium holdup and pressure gradient against measured
+# values, plus KH-flag counts per condition.
 #
-# Two helper functions below support (2): a CFL dt estimator that reuses
-# Stage 0's equilibrium solve (rather than guessing a dt), and a
-# post-processing pressure-gradient recovery (since Change B eliminated
+# Two helper functions below support this: a CFL dt estimator that reuses
+# the equilibrium solver (rather than guessing a dt), and a post-
+# processing pressure-gradient recovery (since Change B eliminated
 # pressure from the EVOLVED state -- it's recoverable afterward from
 # either phase's own steady force balance, never evolved directly).
 
@@ -1393,7 +974,7 @@ def estimate_stable_dt(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, dx,
 
     First attempt (found to be WRONG, kept here as a documented mistake
     rather than silently fixed, since it's instructive): evaluating
-    local_wave_speeds ONLY at Stage 0's equilibrium state. That badly
+    local_wave_speeds ONLY at the equilibrium state. That badly
     underestimated the true max speed for the condition tried here --
     equilibrium eigenvalues came out ~0.64 while the actual run went NaN,
     because the solver starts from the no-slip initial condition (every
@@ -1441,8 +1022,8 @@ def predicted_pressure_gradient(alpha_l, Delta, Q, D, rho_l, rho_g, mu_l, mu_g,
                                  f_i_mult=1.0):
     """
     Post-processing-only pressure gradient, recovered from EACH phase's own
-    steady force balance (see the module comment above Stage 0's
-    taitel_dukler_residual for the two equations this comes from):
+    steady force balance (see the section banner above the equilibrium
+    solver for the two equations this comes from):
 
         liquid:  dP/dz = -tau_wl*S_l/A_l + tau_i*S_i/A_l
         gas:     dP/dz = -tau_wg*S_g/A_g - tau_i*S_i/A_g
@@ -1477,16 +1058,17 @@ def predicted_pressure_gradient(alpha_l, Delta, Q, D, rho_l, rho_g, mu_l, mu_g,
     return dPdz_liquid, dPdz_gas
 
 
-def run_stage6_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
-                          n_transit_times=100.0, cfl=0.25, g=9.81, f_i_mult=1.0,
-                          theta=1.3, outlet_window=10):
+def run_real_data_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
+                             n_transit_times=100.0, cfl=0.25, g=9.81, f_i_mult=1.0,
+                             theta=1.3, outlet_window=10):
     """
     Run one real-data condition to (approximate) steady state and return
     the diagnostics needed to validate against it: predicted outlet
     alpha_l, predicted dP/dz (both phase estimates), total KH-flag count,
     and min/max alpha_l actually visited over the WHOLE run (the direct
-    check on whether removing the defensive clip above was safe for THIS
-    condition, not just the ones tried during Stage 5's own development).
+    check on whether the lack of any defensive alpha_l clip -- see
+    _transport_only_step -- is safe for THIS condition, not just the ones
+    tried during the solver's own development).
 
     dt and n_steps are both derived from the condition itself (via
     estimate_stable_dt and a fixed number of convective transit times,
@@ -1498,7 +1080,7 @@ def run_stage6_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
 
     n_transit_times was raised from 30 to 100 after a longer-run check
     (sampling convergence at 30/60/100/.../300 transit times on the worst
-    disagreeing conditions from the first Stage 6 pass) showed most
+    disagreeing conditions from an earlier validation pass) showed most
     flagged conditions settle cleanly -- EXACTLY (disagree -> 0.0000) --
     by 60-100 transit times, just not yet at 30.
 
@@ -1513,15 +1095,14 @@ def run_stage6_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
     (~1e-6) is enough to flip individual cells across that DISCONTINUOUS
     switch -- producing a dense cluster of "clean" cells plus a minority
     of large-magnitude outlier cells sitting on the other branch. A
-    single-cell read (the old `[-2]` index) has no way to tell which
-    branch is "correct"; see the median-vs-mean comment right where
-    outlet_window is actually used below for why a plain window MEAN
-    isn't the fix either (it still gets dragged by the outliers) and a
-    MEDIAN is. One condition was found to sit close enough to exactly
-    50/50 across that discontinuity that even the median can't recover a
-    trustworthy value -- a genuine, open limitation of the friction
-    closure itself, not something this diagnostic-side fix can paper
-    over.
+    single-cell read has no way to tell which branch is "correct"; see
+    the median-vs-mean comment right where outlet_window is actually used
+    below for why a plain window MEAN isn't the fix either (it still gets
+    dragged by the outliers) and a MEDIAN is. One condition was found to
+    sit close enough to exactly 50/50 across that discontinuity that even
+    the median can't recover a trustworthy value -- a genuine, open
+    limitation of the friction closure itself, not something this
+    diagnostic-side fix can paper over.
     """
     Q = U_sl + U_sg
     dx = L / N
@@ -1535,7 +1116,7 @@ def run_stage6_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
 
     def step(carry, _):
         state, kh_total, a_min, a_max = carry
-        new_state, n_kh_faces = advance_state_stage5(
+        new_state, n_kh_faces = advance_state(
             state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
             alpha_l_inlet, Delta_inlet, g, f_i_mult, theta
         )
@@ -1549,10 +1130,10 @@ def run_stage6_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
     )
 
     # Window outlet diagnostics -- last `outlet_window` INTERIOR cells,
-    # excluding the ghost copy at index -1 (see advance_state_stage5: the
-    # last cell is always a verbatim copy of the second-to-last, so
-    # including it would double-count one real value rather than add an
-    # independent sample).
+    # excluding the ghost copy at index -1 (see advance_state: the last
+    # cell is always a verbatim copy of the second-to-last, so including
+    # it would double-count one real value rather than add an independent
+    # sample).
     #
     # MEDIAN, not mean: a plain mean was tried first and made things WORSE
     # on some conditions. Root cause, found by dumping the raw per-cell
