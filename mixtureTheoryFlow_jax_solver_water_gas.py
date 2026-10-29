@@ -56,24 +56,71 @@ that boundary matters beyond just horizontal flow.
 
 INCLINATION: an axial gravity source term (-(rho_l-rho_g)*g*sin(beta) in
 S_Delta) and a cos(beta) factor on the cross-sectional stratification-
-gravity term in the flux now let the solver take a pipe inclination angle
-`beta` (default 0.0, backward compatible). KNOWN LIMITATION, found by a
-systematic (U_sl x beta) sweep: this is NOT simply "horizontal works, only
-uphill is risky." The solver has no surface tension, so nothing regularizes
-Kelvin-Helmholtz growth at short wavelengths, and growth rate scales with
-equilibrium liquid holdup/phase-velocity shear -- NOT with inclination
-directly. Inclination only matters because it moves the equilibrium
-holdup (uphill raises it via the fixed-U_sg/shrinking-gas-area feedback,
-downhill lowers it). Consequence: even beta=0 blows up to NaN once liquid
-holdup rises past roughly alpha_l~0.5-0.6 at fixed U_sg=5 m/s (confirmed:
-U_sl=0.10 -> alpha_l=0.32, stable; U_sl=0.50 -> alpha_l=0.63, NaN even at
-beta=0). The Fan/MDPI validation above never hit this because both
-datasets happen to sit at low holdup already. Decision (2026-10-29):
-restrict near-term real-data calibration to this already-validated
-low-holdup regime rather than extending to higher liquid fractions or
-uphill inclination; treat surface tension (or an equivalent short-
-wavelength regularizer) as a prerequisite before either of those can be
-trusted, not yet implemented.
+gravity term in the flux let the solver take a pipe inclination angle
+`beta` (default 0.0, backward compatible -- verified bit-identical to
+pre-beta results at beta=0). The plumbing itself (every function
+signature, the Taitel-Dukler equilibrium solver and its custom_jvp rule,
+the flux Jacobian / local_wave_speeds, the implicit friction half-step)
+is correct and gradient-checked; what's NOT yet usable is running it at
+any nonzero beta, or even beta=0 at higher liquid loading -- see the next
+section.
+
+KNOWN LIMITATION -- SCOPE OF WHAT'S DEFERRED (as of 2026-10-29), to revisit
+once zero-inclination, low-holdup real-data calibration is working:
+
+  Root cause (one single thing, not two separate bugs): this solver has
+  no surface tension, so nothing regularizes Kelvin-Helmholtz growth at
+  short wavelengths -- growth rate scales with equilibrium liquid
+  holdup/phase-velocity shear, NOT with inclination angle directly.
+  Inclination is only a SYMPTOM-TRIGGER, not an independent cause: it
+  matters purely because it shifts the equilibrium holdup (uphill raises
+  it via the fixed-U_sg/shrinking-gas-area feedback -- shrinking gas area
+  forces gas velocity up since U_sg is a fixed boundary condition --
+  downhill lowers it). The same instability shows up with beta pinned at
+  0 if holdup is pushed up some other way (e.g. raising U_sl at fixed
+  U_sg), confirmed by direct test below.
+
+  Evidence (systematic U_sl x beta sweep, U_sg=5 m/s fixed, 42
+  conditions, /tmp/inclined_liquid_fraction_scan.py): only 7/42 survived,
+  all at the two lowest U_sl values tested, and NOT uniformly even there.
+    - U_sl=0.10 (alpha_l_eq=0.32, matches the Fan/MDPI validated regime):
+      stable at beta=0 and at every downhill beta tested (-1, -5 deg),
+      NaN at every uphill beta tested (+0.5 through +5 deg).
+    - U_sl=0.50 (alpha_l_eq=0.63): NaN already at beta=0 -- i.e. before
+      inclination is even involved -- but RESCUED back to stable by
+      downhill tilt (-1, -5 deg), consistent with downhill lowering
+      holdup back under the instability threshold.
+    - U_sl>=1.00 (alpha_l_eq>=0.74): NaN at every beta tested, including
+      both downhill extremes -- holdup fraction alone isn't the whole
+      story either; absolute shear (actual u_l, u_g magnitudes) also
+      matters, since U_sl=1.00 at beta=-5 (alpha_l_eq=0.46, LOWER than
+      U_sl=0.50's stable beta=-1 case at alpha_l_eq=0.48) still NaNs.
+  Practical boundary at this U_sg: stable only for alpha_l_eq roughly
+  <.4-0.5ish and beta<=0; this threshold has only been characterized at
+  U_sg=5 m/s, not swept across U_sg.
+
+  Deferred, to do when circling back (roughly in this order):
+    1. Implement surface tension (or an equivalent short-wavelength KH
+       regularizer) -- expected to be the actual fix, not a refinement;
+       see the physical-mechanism discussion this finding came from
+       (Bernoulli-suction destabilizing term vs. gravity-restoring
+       stabilizing term in the flux Jacobian's disc = trace^2/4 - det).
+    2. Re-run the same U_sl x beta sweep (and extend it across U_sg, not
+       just U_sg=5) with surface tension in place; confirm it actually
+       raises the stability boundary for BOTH uphill inclination and
+       high-holdup horizontal flow, since both trace to the same root
+       cause and a real fix should move both.
+    3. Re-verify the existing beta-plumbing/gradient work still behaves
+       correctly once surface tension is added (it was verified correct
+       in isolation, under the old, more restrictive stability regime --
+       worth re-confirming, not re-deriving).
+    4. Only then extend real-data calibration beyond the current
+       low-holdup, beta=0 scope.
+
+  Until then: real-data calibration is restricted to the already-
+  validated low-holdup regime (matching Fan/MDPI) at beta=0. This is not
+  a workaround to patch quietly -- it's the deliberate scope boundary for
+  the current phase of work.
 """
 
 import jax
