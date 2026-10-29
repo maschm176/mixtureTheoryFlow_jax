@@ -2059,6 +2059,121 @@ unnoticed the first time.
 
 ---
 
+## Reduced-Model Water-Gas Solver (Parallel Initiative, Not a Numbered Phase)
+
+**Why this exists, and how it relates to Phase 2g**: Phase 2g (see Three-
+Phase Plan) zero-refit-tests the EXISTING, Ibarra-fitted closure (`phi1`/
+`phi2` state, `PHI_COLLAPSE`, Taitel-Dukler `D_h_i`, S_i/w, k1/k2, `C_D`)
+against gas-water data. That test surfaced "Current Limitation:
+Vanishing-Phase Singularity Dominates (Not Just Bounds) Gas-Liquid Data"
+(see Known Issues above) — both gas-water datasets (MDPI, Fan 2005) are
+dominated by liquid holdups far below `PHI_COLLAPSE`, so there's no
+non-collapsed subset of either left to validate that closure against.
+Rather than lower `PHI_COLLAPSE` or keep hunting for a higher-holdup
+dataset (two of the three options that Known Issues entry left open),
+work started on the third: a genuinely different formulation that
+eliminates the vanishing-phase division BY CONSTRUCTION instead of gating
+around it.
+
+This is a PARALLEL track, not a replacement for or continuation of Phase
+2g's numbering — Phase 2g's own zero-refit check of the OLD closure
+stands as its own (currently blocked, per Known Issues) piece of work,
+untouched by any of this. New files: `mixtureTheoryFlow_jax_solver_
+water_gas.py` (the solver — state is `(alpha_l, Delta)` instead of
+`(phi1, phi2, mom1, mom2, p)`; central-upwind/minmod/positivity-preserving
+numerics instead of Lax-Friedrichs + pressure projection; see the
+module's own docstring for the full derivation) and `mixtureTheoryFlow_
+water_air_jax.ipynb` (sister notebook, split off from the main notebook's
+Phase 2g section on 2026-10-28, commit `cd2b3d7` — to keep the two
+fluid-pair stories from re-triggering the notebook-size crisis that
+forced the original solver extraction). Cell ids there use a
+`gw-<dataset>-` prefix (`gw-mdpi-...`, `gw-fan2005-...`), not `p2g-`,
+specifically because this is its own initiative, not a sub-item of
+Phase 2g.
+
+**Staged plan, deliberately mirroring the oil-water project's own early
+progression** (sanity-check the forward solver → verify the AD/gradient
+chain on synthetic data → calibrate real parameters against real data —
+see "Simulation development" / Phase 1 under Completed Phases for the
+original sequence this is modeled on):
+
+1. **Forward solver runs cleanly, no NaN/instability** — DONE, but with a
+   real scope boundary, not unconditionally. Validated zero-NaN/zero-
+   collapse against both real datasets (Fan 2005, MDPI/Carraretto) at
+   `beta=0` (horizontal), restricted to the low-liquid-holdup regime both
+   datasets actually sit in (`alpha_l` roughly <=0.3-0.4). Pipe
+   inclination (`beta` — NOT `theta`, which is already taken by the
+   minmod slope-limiter coefficient, default 1.3) was added to every
+   function in the chain (commit `93f0ebe`), default `0.0`, verified
+   bit-identical to pre-beta results at `beta=0`. A systematic sweep then
+   found the instability it was meant to test isn't actually an
+   inclination effect: it's a liquid-holdup effect (no surface tension to
+   regularize Kelvin-Helmholtz growth), and `beta=0` itself already NaNs
+   once equilibrium holdup climbs past ~0.5-0.6. Inclination only shifts
+   holdup up or down (uphill raises it, downhill lowers it); it doesn't
+   independently destabilize anything. Full sweep data and an ordered
+   fix-checklist (surface tension first, then re-sweep across inclination
+   and `U_sg`, then re-verify the beta-plumbing/gradients, then only then
+   extend real-data calibration beyond `beta=0`) are in the module
+   docstring ("KNOWN LIMITATION — SCOPE OF WHAT'S DEFERRED", commit
+   `a911ca9`). Until surface tension is added, real-data work stays
+   scoped to `beta=0`, low-holdup — a deliberate boundary, not a bug to
+   route around.
+
+   One direct consequence for the sister notebook: `run_real_data_
+   condition` runs each condition to its own steady state internally and
+   returns final diagnostics directly, so the old solver's oscillation-
+   sweep + quiet-window-classification machinery (see "Phase 2a real-data
+   pipeline" / "Phase inversion physics investigation" under Completed
+   Phases) has no equivalent here — there's no transient trajectory left
+   to chunk or classify, so the sister notebook's per-dataset cells go
+   straight from loading data to running+comparing, with an input-
+   validation cell in between (finite/positive check on `U_sl`/`U_sg`/
+   `D`/`rho_l`/`rho_g`/`mu_l`/`mu_g`/`L`, since Fan 2005's source is a
+   large multi-paper compilation with known placeholder gaps in other
+   columns).
+2. **Generate a synthetic dataset, confirm the AD framework works
+   end-to-end** — NOT YET DONE. Mirrors Phase 1's original goal for the
+   oil-water solver: verify `jax.grad` flows through the full timestep
+   back to a calibration parameter, using known-answer synthetic data,
+   before ever touching real data. The new solver already has two custom
+   `jax.custom_jvp` rules (`solve_taitel_dukler_holdup`, `h_l_of_alpha`)
+   built and verified in isolation via the implicit function theorem, but
+   end-to-end differentiability through a full `advance_state`/
+   `run_real_data_condition` call — the actual question Phase 1 answered
+   for the old solver — hasn't been checked yet for this one. Needs its
+   own synthetic-condition generator (known `f_i_mult`, run forward,
+   treat the output as a synthetic "measurement") and a gradient check
+   (`d(loss)/d(f_i_mult)` nonzero, correct sign) before any real-data fit
+   is trustworthy.
+3. **Calibrate real parameters against real data** — NOT YET DONE,
+   blocked on step 2. The new solver currently has exactly ONE
+   calibration knob, `f_i_mult` (interfacial friction multiplier, default
+   `1.0`, unmodified/uncalibrated) — structurally the same role as the
+   old solver's `w`, a multiplicative correction on the interfacial
+   friction term, not yet its own fitted value. Zero-refit (`f_i_mult=
+   1.0`) forward results already exist informally (from a parallel
+   session's own test, not yet reproduced in this notebook/pipeline):
+   holdup error ~46-47% mean on both datasets, pressure-gradient error
+   median -36% (Fan)/+4-8% (MDPI) — comparable in magnitude to the OLD
+   solver's own pre-calibration errors against Ibarra, consistent with
+   "this is what an uncalibrated closure looks like," not evidence of a
+   bug. Expect this to follow the same w → k1/k2 → C_D progression once
+   it starts: fit the one existing knob (`f_i_mult`) first, see what
+   error remains, then decide whether a second parameter (e.g. a
+   wall-friction-magnitude multiplier analogous to k1/k2) is needed
+   before reaching for anything richer (NN-learned, dimensionless-input
+   closure — Phase 2e/2f's eventual direction for the old solver).
+
+**Explicitly deferred, tracked as its own checklist** (see Known Issues'
+"Vanishing-Phase Singularity Dominates..." entry and the module
+docstring's "KNOWN LIMITATION" section for the full reasoning): surface
+tension / KH regularization, re-sweeping across inclination and `U_sg`,
+re-verifying gradients once that's added, and only then lifting the Fan
+(2005) horizontal-only filter to include its other 47 (inclined) rows.
+
+---
+
 ## Code Structure
 
 ```
