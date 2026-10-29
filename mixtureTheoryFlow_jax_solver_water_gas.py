@@ -49,7 +49,31 @@ STATUS: validated end-to-end against the independent steady Taitel-Dukler
 equilibrium solver below, and against all real stratified-wavy conditions
 in two literature datasets (Fan 2005, MDPI/Carraretto 2020) -- zero NaN,
 zero phase collapse, the exact regime that was 100% unusable on the old
-solver's PHI_COLLAPSE-bounded formulation.
+solver's PHI_COLLAPSE-bounded formulation. Both datasets sit at low liquid
+holdup (alpha_l roughly <= 0.3-0.4), which is also exactly the regime this
+validation is currently trustworthy in -- see INCLINATION below for why
+that boundary matters beyond just horizontal flow.
+
+INCLINATION: an axial gravity source term (-(rho_l-rho_g)*g*sin(beta) in
+S_Delta) and a cos(beta) factor on the cross-sectional stratification-
+gravity term in the flux now let the solver take a pipe inclination angle
+`beta` (default 0.0, backward compatible). KNOWN LIMITATION, found by a
+systematic (U_sl x beta) sweep: this is NOT simply "horizontal works, only
+uphill is risky." The solver has no surface tension, so nothing regularizes
+Kelvin-Helmholtz growth at short wavelengths, and growth rate scales with
+equilibrium liquid holdup/phase-velocity shear -- NOT with inclination
+directly. Inclination only matters because it moves the equilibrium
+holdup (uphill raises it via the fixed-U_sg/shrinking-gas-area feedback,
+downhill lowers it). Consequence: even beta=0 blows up to NaN once liquid
+holdup rises past roughly alpha_l~0.5-0.6 at fixed U_sg=5 m/s (confirmed:
+U_sl=0.10 -> alpha_l=0.32, stable; U_sl=0.50 -> alpha_l=0.63, NaN even at
+beta=0). The Fan/MDPI validation above never hit this because both
+datasets happen to sit at low holdup already. Decision (2026-10-29):
+restrict near-term real-data calibration to this already-validated
+low-holdup regime rather than extending to higher liquid fractions or
+uphill inclination; treat surface tension (or an equivalent short-
+wavelength regularizer) as a prerequisite before either of those can be
+trusted, not yet implemented.
 """
 
 import jax
@@ -172,12 +196,13 @@ def fanning_wall_shear(u, rho, mu, D_h, Re_turb_cutoff=2100.0):
 
 
 def stratified_momentum_source(A, A_l, A_g, S_l, S_g, S_i, u_l, u_g,
-                                rho_l, rho_g, mu_l, mu_g, f_i_mult=1.0):
+                                rho_l, rho_g, mu_l, mu_g, f_i_mult=1.0,
+                                g=9.81, beta=0.0):
     """
-    Horizontal (beta=0) combined per-area momentum source S_Delta, given
-    ALREADY-COMPUTED geometry and velocities. Pure closure function --
-    everything specific to "where did u_l/u_g come from" lives outside
-    this function, in its two callers:
+    Combined per-area momentum source S_Delta, given ALREADY-COMPUTED
+    geometry and velocities. Pure closure function -- everything specific
+    to "where did u_l/u_g come from" lives outside this function, in its
+    two callers:
       - taitel_dukler_residual (steady equilibrium solver): u_l=U_sl/alpha_l,
         u_g=U_sg/alpha_g (the steady, uniform-flow special case).
       - dynamic_source_Delta (transient solver): u_l, u_g from
@@ -192,6 +217,20 @@ def stratified_momentum_source(A, A_l, A_g, S_l, S_g, S_i, u_l, u_g,
     to 1.0 (unmodified smooth closure). It's the hook point for later
     replacing the interfacial friction with a learned correction without
     touching this function's structure.
+
+    beta is the pipe inclination angle from horizontal (beta=0 is
+    horizontal, matching every acceptance test this solver was originally
+    built and validated against). The axial gravity term below is derived
+    the same way as the rest of S_Delta: each phase's OWN steady force
+    balance now also carries an along-pipe gravity component,
+    -rho_i*g*sin(beta)*A_i (opposing or assisting flow depending on
+    whether the pipe inclines up or down); dividing by A_l/A_g and
+    subtracting (same derivation as the dp/dx cancellation in the module
+    banner above) leaves -(rho_l-rho_g)*g*sin(beta) surviving in the
+    combined equation, since dp/dx was the only thing that canceled
+    there -- this term does NOT cancel, it's new physics, not plumbing.
+    At beta=0 this is identically zero and S_Delta is unchanged from the
+    horizontal-only form every existing acceptance test already verified.
     """
     D_l = 4.0 * A_l / (S_l + 1e-12)
     D_g = 4.0 * A_g / (S_g + S_i + 1e-12)
@@ -217,19 +256,21 @@ def stratified_momentum_source(A, A_l, A_g, S_l, S_g, S_i, u_l, u_g,
 
     S_Delta = (-tau_wl * S_l / A_l
                + tau_wg * S_g / A_g
-               + tau_i * S_i * (1.0 / A_l + 1.0 / A_g))
+               + tau_i * S_i * (1.0 / A_l + 1.0 / A_g)
+               - (rho_l - rho_g) * g * jnp.sin(beta))
     return S_Delta
 
 
 def taitel_dukler_residual(ht, U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g,
-                            f_i_mult=1.0):
+                            f_i_mult=1.0, g=9.81, beta=0.0):
     """
-    Horizontal (beta=0) steady combined-momentum residual S_Delta(ht).
-    The root ht* where this is zero is the equilibrium stratified holdup
-    for the given superficial velocities -- see the section banner above
-    for the derivation. Thin wrapper around stratified_momentum_source --
-    see that function's docstring for the closure details and why it's
-    factored out this way.
+    Steady combined-momentum residual S_Delta(ht), including the axial
+    gravity term when beta != 0 (see stratified_momentum_source's
+    docstring for its derivation). The root ht* where this is zero is the
+    equilibrium stratified holdup for the given superficial velocities --
+    see the section banner above for the dp/dx-cancellation derivation.
+    Thin wrapper around stratified_momentum_source -- see that function's
+    docstring for the closure details and why it's factored out this way.
     """
     A, A_l, A_g, S_l, S_g, S_i = td_geometry(ht, D)
 
@@ -239,10 +280,12 @@ def taitel_dukler_residual(ht, U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g,
     u_g = U_sg / jnp.maximum(alpha_g, 1e-9)
 
     return stratified_momentum_source(A, A_l, A_g, S_l, S_g, S_i, u_l, u_g,
-                                       rho_l, rho_g, mu_l, mu_g, f_i_mult)
+                                       rho_l, rho_g, mu_l, mu_g, f_i_mult,
+                                       g, beta)
 
 
-def _bisect_ht(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult, n_iter=60):
+def _bisect_ht(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult, g=9.81,
+                beta=0.0, n_iter=60):
     """
     Plain bisection for the root of taitel_dukler_residual over ht in
     (0,1). Not meant to be differentiated through directly -- see
@@ -252,14 +295,19 @@ def _bisect_ht(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult, n_iter=60):
     S_Delta(ht) is monotonically decreasing over the physical range in
     every case checked by the test below (more liquid -> liquid wall
     friction term grows and dominates) -- not proven in general here, just
-    verified empirically for the stratified-wavy regime this is meant for.
+    verified empirically for the stratified-wavy regime this is meant for,
+    and only re-checked at beta=0 so far; the axial gravity term added for
+    nonzero beta is a CONSTANT shift in ht (independent of ht itself), so
+    it can't change where S_Delta(ht) is increasing/decreasing, only shift
+    the whole curve up or down -- monotonicity is preserved by
+    construction, not something nonzero beta could break on its own.
     """
     lo = jnp.asarray(1e-4, dtype=jnp.float64)
     hi = jnp.asarray(1.0 - 1e-4, dtype=jnp.float64)
 
     def resid(ht):
         return taitel_dukler_residual(ht, U_sl, U_sg, D, rho_l, rho_g,
-                                       mu_l, mu_g, f_i_mult)
+                                       mu_l, mu_g, f_i_mult, g, beta)
 
     def body(_, carry):
         lo, hi = carry
@@ -277,7 +325,7 @@ def _bisect_ht(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult, n_iter=60):
 
 @jax.custom_jvp
 def solve_taitel_dukler_holdup(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g,
-                                f_i_mult=1.0):
+                                f_i_mult=1.0, g=9.81, beta=0.0):
     """
     Equilibrium liquid height h_l/D for given superficial velocities,
     found by bisecting the combined-momentum residual S_Delta(ht) = 0.
@@ -295,33 +343,36 @@ def solve_taitel_dukler_holdup(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g,
 
     Both quantities are cheap: jax.grad / jax.jvp of the plain, smooth
     residual function evaluated ONCE at the already-converged ht* -- no
-    need to differentiate through the solve itself at all.
+    need to differentiate through the solve itself at all. beta is one
+    more parameter this same rule applies to unchanged -- it enters
+    taitel_dukler_residual exactly like any other physical parameter, so
+    dht*/dbeta falls out of the same jvp call with no special-casing.
     """
-    return _bisect_ht(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult)
+    return _bisect_ht(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult, g, beta)
 
 
 @solve_taitel_dukler_holdup.defjvp
 def _solve_taitel_dukler_holdup_jvp(primals, tangents):
-    U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult = primals
+    U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult, g, beta = primals
     d_primals = tangents
 
-    ht_star = _bisect_ht(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult)
+    ht_star = _bisect_ht(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult, g, beta)
 
     # dS_Delta/dht* at the solution.
     dS_dht = jax.grad(taitel_dukler_residual, argnums=0)(
-        ht_star, U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult
+        ht_star, U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult, g, beta
     )
 
     # (dS_Delta/dparams) . dparams in one shot via jvp, holding ht fixed
     # at ht_star -- this is a directional derivative of the residual
     # through every OTHER argument at once.
-    def residual_at_fixed_ht(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult):
+    def residual_at_fixed_ht(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult, g, beta):
         return taitel_dukler_residual(ht_star, U_sl, U_sg, D, rho_l, rho_g,
-                                       mu_l, mu_g, f_i_mult)
+                                       mu_l, mu_g, f_i_mult, g, beta)
 
     _, dS_dparams = jax.jvp(
         residual_at_fixed_ht,
-        (U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult),
+        (U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult, g, beta),
         d_primals,
     )
 
@@ -456,15 +507,13 @@ def recover_velocities(alpha_l, Delta, Q, rho_l, rho_g):
     return u_l, u_g
 
 
-def physical_flux(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81):
+def physical_flux(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81, beta=0.0):
     """
-    Physical (non-dissipative) flux for the (alpha_l, Delta) system,
-    horizontal pipe (beta=0, matching the equilibrium solver's scope --
-    the sin(beta) source term and cos(beta) factor both drop out).
+    Physical (non-dissipative) flux for the (alpha_l, Delta) system.
 
         flux_alpha = alpha_l*u_l
         flux_Delta = 0.5*rho_l*u_l**2 - 0.5*rho_g*u_g**2
-                     + (rho_l-rho_g)*g*h_l(alpha_l)
+                     + (rho_l-rho_g)*g*cos(beta)*h_l(alpha_l)
 
     The h_l(alpha_l) term is the direct analog of the Saint-Venant
     system's g*(h+B) term in the Kurganov-Petrova paper: it's what makes
@@ -474,18 +523,26 @@ def physical_flux(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81):
     structural match is why that paper's numerics (central-upwind flux,
     local eigenvalues, positivity-preserving reconstruction) carry over
     cleanly here, not just the velocity-desingularization idea above.
+
+    The cos(beta) factor is new: at nonzero inclination, only the
+    component of gravity PERPENDICULAR to the pipe axis drives
+    cross-sectional stratification -- the component ALONG the axis
+    instead drives/retards the flow directly, which is a separate new
+    term in dynamic_source_Delta/stratified_momentum_source (S_Delta),
+    not in this flux. At beta=0, cos(beta)=1 and this is identical to the
+    form every existing acceptance test already verified.
     """
     u_l, u_g = recover_velocities(alpha_l, Delta, Q, rho_l, rho_g)
     h_l = h_l_of_alpha(alpha_l, D)
 
     flux_alpha = alpha_l * u_l
     flux_Delta = (0.5 * rho_l * u_l**2 - 0.5 * rho_g * u_g**2
-                  + (rho_l - rho_g) * g * h_l)
+                  + (rho_l - rho_g) * g * jnp.cos(beta) * h_l)
     return flux_alpha, flux_Delta
 
 
 def dynamic_source_Delta(alpha_l, Delta, Q, D, rho_l, rho_g, mu_l, mu_g,
-                          f_i_mult=1.0):
+                          f_i_mult=1.0, g=9.81, beta=0.0):
     """
     S_Delta evaluated at a real, local (possibly transient) state -- the
     transient counterpart of taitel_dukler_residual's steady equation,
@@ -493,13 +550,15 @@ def dynamic_source_Delta(alpha_l, Delta, Q, D, rho_l, rho_g, mu_l, mu_g,
     function's docstring for why this matters -- it's what makes "the
     transient solver relaxes to the steady equilibrium" a real check of
     correctness, not a comparison between two independently-written
-    closures).
+    closures). beta threads through to the axial gravity term described
+    there.
     """
     ht = _newton_ht_from_alpha(alpha_l, D)
     A, A_l, A_g, S_l, S_g, S_i = td_geometry(ht, D)
     u_l, u_g = recover_velocities(alpha_l, Delta, Q, rho_l, rho_g)
     return stratified_momentum_source(A, A_l, A_g, S_l, S_g, S_i, u_l, u_g,
-                                       rho_l, rho_g, mu_l, mu_g, f_i_mult)
+                                       rho_l, rho_g, mu_l, mu_g, f_i_mult,
+                                       g, beta)
 
 
 def init_state_water_gas(N, U_sl, U_sg, rho_l, rho_g):
@@ -529,7 +588,7 @@ def init_state_water_gas(N, U_sl, U_sg, rho_l, rho_g):
 # "velocity plus/minus a gravity-wave correction", the same structural
 # shape as shallow water's u +/- sqrt(g*h).
 
-def local_wave_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81):
+def local_wave_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81, beta=0.0):
     """
     Local characteristic (wave) speeds of the (alpha_l, Delta) system, at
     every cell -- the eigenvalues of the flux Jacobian J = dF/dU, where
@@ -564,10 +623,10 @@ def local_wave_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81):
     than silently returning NaN or under-damping there.
     """
     jac_fn = jax.jacfwd(physical_flux, argnums=(0, 1))
-    jac_vmapped = jax.vmap(jac_fn, in_axes=(0, 0, None, None, None, None, None))
+    jac_vmapped = jax.vmap(jac_fn, in_axes=(0, 0, None, None, None, None, None, None))
 
     (dFa_dalpha, dFa_dDelta), (dFd_dalpha, dFd_dDelta) = jac_vmapped(
-        alpha_l, Delta, Q, D, rho_l, rho_g, g
+        alpha_l, Delta, Q, D, rho_l, rho_g, g, beta
     )
 
     trace = dFa_dalpha + dFd_dDelta
@@ -594,7 +653,7 @@ def local_wave_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81):
 # of a single symmetric (Rusanov/Lax-Friedrichs-style) blanket damping
 # sized by whichever direction's wave happens to be fastest.
 
-def central_upwind_face_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81):
+def central_upwind_face_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81, beta=0.0):
     """
     Per-face one-sided speeds for the central-upwind flux, from the same
     per-cell eigenvalues local_wave_speeds already computes (lam1 <= lam2
@@ -605,8 +664,14 @@ def central_upwind_face_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g=9.81):
 
         a_plus  = max(lam2_L, lam2_R, 0)   -- fastest RIGHTWARD speed, >= 0
         a_minus = min(lam1_L, lam1_R, 0)   -- fastest LEFTWARD speed, <= 0
+
+    NOTE: not currently called anywhere in this file -- advance_state's
+    transport step inlines the same first-order-vs-reconstructed logic
+    directly via two separate local_wave_speeds calls instead of this
+    helper. Kept (and kept correct) as a small, independently-testable
+    building block, not because anything here depends on it.
     """
-    lam1, lam2, is_complex = local_wave_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g)
+    lam1, lam2, is_complex = local_wave_speeds(alpha_l, Delta, Q, D, rho_l, rho_g, g, beta)
 
     a_plus  = jnp.maximum(jnp.maximum(lam2[:-1], lam2[1:]), 0.0)
     a_minus = jnp.minimum(jnp.minimum(lam1[:-1], lam1[1:]), 0.0)
@@ -777,7 +842,8 @@ def positivity_correct(U_center, left_face, right_face, lo=0.0, hi=1.0):
 # unchanged.
 
 def _implicit_friction_half_step(alpha_l_int, Delta_int, Q, D, rho_l, rho_g,
-                                  mu_l, mu_g, dt_half, f_i_mult=1.0):
+                                  mu_l, mu_g, dt_half, f_i_mult=1.0, g=9.81,
+                                  beta=0.0):
     """
     Linearized-implicit half-step on Delta ONLY -- alpha_l and Q are
     frozen (per the design doc: "In each cell, alpha_l and Q are frozen;
@@ -792,9 +858,17 @@ def _implicit_friction_half_step(alpha_l_int, Delta_int, Q, D, rho_l, rho_g,
     _newton_ht_from_alpha chain), so vmapping its value_and_grad over
     cells gives exactly the per-cell (S0, dS/dDelta) pair the formula
     needs, same pattern used for local_wave_speeds' per-cell Jacobian.
+
+    The axial gravity term (beta != 0) is a CONSTANT additive piece of
+    S0 (independent of Delta -- see stratified_momentum_source), so it
+    changes S0 but not dS/dDelta at all. It's folded into this same
+    implicit solve for free, not handled separately, since it isn't
+    stiff the way friction is -- there's no reason to split it out into
+    its own treatment.
     """
     def source_fn(a, d):
-        return dynamic_source_Delta(a, d, Q, D, rho_l, rho_g, mu_l, mu_g, f_i_mult)
+        return dynamic_source_Delta(a, d, Q, D, rho_l, rho_g, mu_l, mu_g,
+                                     f_i_mult, g, beta)
 
     S0, dS = jax.vmap(jax.value_and_grad(source_fn, argnums=1))(alpha_l_int, Delta_int)
 
@@ -802,7 +876,8 @@ def _implicit_friction_half_step(alpha_l_int, Delta_int, Q, D, rho_l, rho_g,
 
 
 def _transport_only_step(state, dt, dx, Q, D, rho_l, rho_g,
-                          alpha_l_inlet, Delta_inlet, g=9.81, theta=1.3):
+                          alpha_l_inlet, Delta_inlet, g=9.81, theta=1.3,
+                          beta=0.0):
     """
     The reconstruction + positivity correction + central-upwind flux
     update used throughout this file, WITH THE SOURCE TERM REMOVED --
@@ -838,13 +913,13 @@ def _transport_only_step(state, dt, dx, Q, D, rho_l, rho_g,
     Delta_L = jnp.concatenate([Delta[0:1], Delta_rf])
     Delta_R = jnp.concatenate([Delta_lf, Delta[-1:]])
 
-    F_alpha_L, F_Delta_L = physical_flux(alpha_L, Delta_L, Q, D, rho_l, rho_g, g)
-    F_alpha_R, F_Delta_R = physical_flux(alpha_R, Delta_R, Q, D, rho_l, rho_g, g)
+    F_alpha_L, F_Delta_L = physical_flux(alpha_L, Delta_L, Q, D, rho_l, rho_g, g, beta)
+    F_alpha_R, F_Delta_R = physical_flux(alpha_R, Delta_R, Q, D, rho_l, rho_g, g, beta)
 
     # Local speeds evaluated AT the reconstructed face states themselves,
     # not at the neighboring cells' own centers.
-    lam1_L, lam2_L, is_complex_L = local_wave_speeds(alpha_L, Delta_L, Q, D, rho_l, rho_g, g)
-    lam1_R, lam2_R, is_complex_R = local_wave_speeds(alpha_R, Delta_R, Q, D, rho_l, rho_g, g)
+    lam1_L, lam2_L, is_complex_L = local_wave_speeds(alpha_L, Delta_L, Q, D, rho_l, rho_g, g, beta)
+    lam1_R, lam2_R, is_complex_R = local_wave_speeds(alpha_R, Delta_R, Q, D, rho_l, rho_g, g, beta)
 
     a_plus  = jnp.maximum(jnp.maximum(lam2_L, lam2_R), 0.0)
     a_minus = jnp.minimum(jnp.minimum(lam1_L, lam1_R), 0.0)
@@ -871,7 +946,8 @@ def _transport_only_step(state, dt, dx, Q, D, rho_l, rho_g,
 
 
 def _ssp_rk2_transport(state, dt, dx, Q, D, rho_l, rho_g,
-                        alpha_l_inlet, Delta_inlet, g=9.81, theta=1.3):
+                        alpha_l_inlet, Delta_inlet, g=9.81, theta=1.3,
+                        beta=0.0):
     """
     SSP-RK2 (Heun's method): two forward-Euler-like transport stages,
     averaged -- same pattern already sketched in the old solver's RK2
@@ -879,9 +955,9 @@ def _ssp_rk2_transport(state, dt, dx, Q, D, rho_l, rho_g,
     applied here to the source-free transport update specifically.
     """
     stage1, kh1 = _transport_only_step(state, dt, dx, Q, D, rho_l, rho_g,
-                                        alpha_l_inlet, Delta_inlet, g, theta)
+                                        alpha_l_inlet, Delta_inlet, g, theta, beta)
     stage2, kh2 = _transport_only_step(stage1, dt, dx, Q, D, rho_l, rho_g,
-                                        alpha_l_inlet, Delta_inlet, g, theta)
+                                        alpha_l_inlet, Delta_inlet, g, theta, beta)
 
     new_state = jax.tree.map(lambda a, b: 0.5 * (a + b), state, stage2)
     return new_state, kh1 + kh2
@@ -889,7 +965,7 @@ def _ssp_rk2_transport(state, dt, dx, Q, D, rho_l, rho_g,
 
 def advance_state(state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
                    alpha_l_inlet, Delta_inlet, g=9.81, f_i_mult=1.0,
-                   theta=1.3):
+                   theta=1.3, beta=0.0):
     """
     Full Strang-split timestep: implicit friction half-step (dt/2) ->
     explicit SSP-RK2 transport full-step (dt) -> implicit friction
@@ -903,20 +979,22 @@ def advance_state(state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
 
     # Part 1: implicit friction half-step
     Delta_int_1 = _implicit_friction_half_step(
-        alpha_l[1:-1], Delta[1:-1], Q, D, rho_l, rho_g, mu_l, mu_g, dt / 2.0, f_i_mult
+        alpha_l[1:-1], Delta[1:-1], Q, D, rho_l, rho_g, mu_l, mu_g, dt / 2.0,
+        f_i_mult, g, beta
     )
     Delta_1 = jnp.concatenate([Delta[0:1], Delta_int_1, Delta_int_1[-1:]])
     state_1 = {'alpha_l': alpha_l, 'Delta': Delta_1}
 
     # Part 2: explicit SSP-RK2 transport
     state_2, n_kh = _ssp_rk2_transport(
-        state_1, dt, dx, Q, D, rho_l, rho_g, alpha_l_inlet, Delta_inlet, g, theta
+        state_1, dt, dx, Q, D, rho_l, rho_g, alpha_l_inlet, Delta_inlet, g, theta, beta
     )
 
     # Part 3: second implicit friction half-step
     alpha_l_2, Delta_2 = state_2['alpha_l'], state_2['Delta']
     Delta_int_3 = _implicit_friction_half_step(
-        alpha_l_2[1:-1], Delta_2[1:-1], Q, D, rho_l, rho_g, mu_l, mu_g, dt / 2.0, f_i_mult
+        alpha_l_2[1:-1], Delta_2[1:-1], Q, D, rho_l, rho_g, mu_l, mu_g, dt / 2.0,
+        f_i_mult, g, beta
     )
     Delta_final = jnp.concatenate([Delta_2[0:1], Delta_int_3, Delta_int_3[-1:]])
 
@@ -924,7 +1002,7 @@ def advance_state(state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
 
 
 def run_to_steady(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N,
-                   dt, n_steps, g=9.81, f_i_mult=1.0, theta=1.3):
+                   dt, n_steps, g=9.81, f_i_mult=1.0, theta=1.3, beta=0.0):
     """
     Run the full solver (advance_state) from the no-slip initial condition
     for n_steps of size dt, via jax.lax.scan. Returns the final state and
@@ -941,7 +1019,7 @@ def run_to_steady(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N,
         state, kh_total = carry
         new_state, n_kh_faces = advance_state(
             state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
-            alpha_l_inlet, Delta_inlet, g, f_i_mult, theta
+            alpha_l_inlet, Delta_inlet, g, f_i_mult, theta, beta
         )
         return (new_state, kh_total + n_kh_faces), None
 
@@ -967,7 +1045,7 @@ def run_to_steady(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N,
 # either phase's own steady force balance, never evolved directly).
 
 def estimate_stable_dt(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, dx,
-                        f_i_mult=1.0, cfl=0.25, n_sample=20):
+                        f_i_mult=1.0, cfl=0.25, n_sample=20, g=9.81, beta=0.0):
     """
     Physically-grounded dt estimate for a real data condition, instead of
     guessing a fixed dt and hoping it's small enough.
@@ -1000,7 +1078,8 @@ def estimate_stable_dt(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, dx,
     alpha_l_inlet = U_sl / Q
     Delta_inlet   = (rho_l - rho_g) * Q
 
-    ht_eq = solve_taitel_dukler_holdup(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult)
+    ht_eq = solve_taitel_dukler_holdup(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g,
+                                        f_i_mult, g, beta)
     A, A_l, A_g, S_l, S_g, S_i = td_geometry(ht_eq, D)
     alpha_l_eq = A_l / A
     alpha_g_eq = A_g / A
@@ -1012,21 +1091,29 @@ def estimate_stable_dt(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, dx,
     alpha_path = alpha_l_inlet + t * (alpha_l_eq - alpha_l_inlet)
     Delta_path = Delta_inlet + t * (Delta_eq - Delta_inlet)
 
-    lam1, lam2, _ = local_wave_speeds(alpha_path, Delta_path, Q, D, rho_l, rho_g)
+    lam1, lam2, _ = local_wave_speeds(alpha_path, Delta_path, Q, D, rho_l, rho_g, g, beta)
     speed = jnp.max(jnp.maximum(jnp.abs(lam1), jnp.abs(lam2)))
     speed = jnp.maximum(speed, 1e-3)
     return cfl * dx / speed
 
 
 def predicted_pressure_gradient(alpha_l, Delta, Q, D, rho_l, rho_g, mu_l, mu_g,
-                                 f_i_mult=1.0):
+                                 f_i_mult=1.0, g=9.81, beta=0.0):
     """
     Post-processing-only pressure gradient, recovered from EACH phase's own
     steady force balance (see the section banner above the equilibrium
     solver for the two equations this comes from):
 
-        liquid:  dP/dz = -tau_wl*S_l/A_l + tau_i*S_i/A_l
-        gas:     dP/dz = -tau_wg*S_g/A_g - tau_i*S_i/A_g
+        liquid:  dP/dz = -tau_wl*S_l/A_l + tau_i*S_i/A_l - rho_l*g*sin(beta)
+        gas:     dP/dz = -tau_wg*S_g/A_g - tau_i*S_i/A_g - rho_g*g*sin(beta)
+
+    The -rho_i*g*sin(beta) term is each phase's own axial gravity
+    component, carried over directly from the same per-phase balance
+    stratified_momentum_source's docstring derives S_Delta's new term
+    from -- it survives here individually (unlike in S_Delta, where only
+    the DIFFERENCE rho_l-rho_g survives), since this function recovers
+    each phase's own dP/dz separately rather than their combined
+    equation. At beta=0 both reduce to the original horizontal formula.
 
     At a genuinely converged steady profile these should closely agree --
     that's exactly the condition dynamic_source_Delta (their DIFFERENCE)
@@ -1053,14 +1140,14 @@ def predicted_pressure_gradient(alpha_l, Delta, Q, D, rho_l, rho_g, mu_l, mu_g,
     u_rel = u_g - u_l
     tau_i = f_i_mult * 0.5 * f_g * rho_g * jnp.abs(u_rel) * u_rel
 
-    dPdz_liquid = -tau_wl * S_l / A_l + tau_i * S_i / A_l
-    dPdz_gas    = -tau_wg * S_g / A_g - tau_i * S_i / A_g
+    dPdz_liquid = -tau_wl * S_l / A_l + tau_i * S_i / A_l - rho_l * g * jnp.sin(beta)
+    dPdz_gas    = -tau_wg * S_g / A_g - tau_i * S_i / A_g - rho_g * g * jnp.sin(beta)
     return dPdz_liquid, dPdz_gas
 
 
 def run_real_data_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
                              n_transit_times=100.0, cfl=0.25, g=9.81, f_i_mult=1.0,
-                             theta=1.3, outlet_window=10):
+                             theta=1.3, outlet_window=10, beta=0.0):
     """
     Run one real-data condition to (approximate) steady state and return
     the diagnostics needed to validate against it: predicted outlet
@@ -1106,7 +1193,8 @@ def run_real_data_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
     """
     Q = U_sl + U_sg
     dx = L / N
-    dt = estimate_stable_dt(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, dx, f_i_mult, cfl)
+    dt = estimate_stable_dt(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, dx, f_i_mult,
+                             cfl, g=g, beta=beta)
     t_end = n_transit_times * (L / Q)
     n_steps = int(np.ceil(float(t_end / dt)))
 
@@ -1118,7 +1206,7 @@ def run_real_data_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
         state, kh_total, a_min, a_max = carry
         new_state, n_kh_faces = advance_state(
             state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
-            alpha_l_inlet, Delta_inlet, g, f_i_mult, theta
+            alpha_l_inlet, Delta_inlet, g, f_i_mult, theta, beta
         )
         a_min = jnp.minimum(a_min, jnp.min(new_state['alpha_l']))
         a_max = jnp.maximum(a_max, jnp.max(new_state['alpha_l']))
@@ -1152,7 +1240,7 @@ def run_real_data_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
     alpha_l_window = final_state['alpha_l'][-(outlet_window + 1):-1]
     Delta_window   = final_state['Delta'][-(outlet_window + 1):-1]
     dPdz_l_arr, dPdz_g_arr = predicted_pressure_gradient(
-        alpha_l_window, Delta_window, Q, D, rho_l, rho_g, mu_l, mu_g, f_i_mult
+        alpha_l_window, Delta_window, Q, D, rho_l, rho_g, mu_l, mu_g, f_i_mult, g, beta
     )
     alpha_l_outlet = jnp.median(alpha_l_window)
     dPdz_l = jnp.median(dPdz_l_arr)
