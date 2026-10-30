@@ -2165,6 +2165,78 @@ original sequence this is modeled on):
    before reaching for anything richer (NN-learned, dimensionless-input
    closure — Phase 2e/2f's eventual direction for the old solver).
 
+**MDPI input verification (2026-10-30)**: before trusting the zero-refit
+run against MDPI, checked the constants in the driver cell
+(`D_mdpi=0.060`, `L_mdpi=24.0`, `rho_l_mdpi=998.0`, `rho_g_mdpi=1.204`,
+`mu_l_mdpi=1.0e-3`, `mu_g_mdpi=1.81e-5`) against the source paper
+(Carraretto et al. 2020) directly, the same discipline that caught the
+Angeli pipe-length bug. Pipe diameter and length confirmed exactly
+against the paper's stated 24 m / 60 mm test section. Fluid properties
+are NOT stated anywhere in the paper as numbers — checked the
+nomenclature section, Materials and Methods, every table, and the
+appendix; `rho`/`mu` only appear as symbols. The one supporting evidence:
+Table 1 states both flowmeters were calibrated at `T_cal=20°C`, and the
+air meter specifically at `p_cal=101,325 Pa` (1 atm) — exactly the
+conditions the current constants (standard 20°C/1atm water/air
+properties) assume. Treated as "as verified as it can be," not a hard
+confirmation, since the paper never quotes the numbers directly.
+
+**Context from the paper's own literature comparison, relevant to
+interpreting ANY zero-refit result here**: Figure 8 and the Conclusions
+report that established two-fluid interfacial-shear closures (Taitel-
+Dukler, Ullman-Brauner) tested against this exact dataset show MAPE of
+100-300% for `J_G` below ~0.9-1.3 m/s, dropping below 30% only above that
+threshold. The paper's own best-fit empirical correlation across their
+data is `f_i = 2.25*Re_SG^-0.53` (their Eq. 14) — a useful reference point
+once `f_i_mult` calibration starts. This means large zero-refit errors at
+low gas velocity are not unique to this project's solver or evidence of a
+bug — they're the documented state of the art for this regime across the
+field, which meaningfully de-risks treating the MDPI zero-refit error as a
+genuine calibration target rather than something to keep debugging.
+
+**Fan (2005) zero-refit run surfaces a second instability trigger — shear,
+not just holdup (2026-10-30)**: running all 13 horizontal Fan conditions
+showed 11 clean (`kh_total=0`) and 2 with `kh_total` in the millions
+(~15M) — hyperbolicity broke down for a large fraction of those two
+runs. Both outputs still looked like plausible, finite numbers (no
+`any_nan`), which is the real danger: `any_nan=False` alone is NOT
+sufficient to trust a result, `kh_total` has to be checked too. Decision:
+any condition with `kh_total > 0` is excluded from error stats AND from
+any future calibration fit, same treatment `PHI_COLLAPSE`-collapsed
+conditions got in the old solver — a broken-hyperbolicity output can't be
+fit against no matter what `f_i_mult` is tried, and including it would
+only pollute the loss. Implemented as a binary cutoff (any `kh_total > 0`
+excludes) rather than a tolerance, since there's no example yet of a
+small, survivable KH count to calibrate a softer threshold against —
+every condition seen so far is either exactly 0 or catastrophic.
+
+Both blown-up conditions sit at `U_sg≈19.7-19.9 m/s` and are specifically
+the two HIGHEST-`U_sl` members of that `U_sg` group (0.0143, 0.0103) —
+the lower-`U_sl` members of the same group (down to `U_sl=0.0008`) are
+all clean. This extends the inclination-finding's own stability
+characterization (done only at `U_sg=5 m/s`, needing equilibrium holdup
+above ~0.5-0.6 to trigger) to a regime it hadn't covered: at `U_sg≈20`,
+the same instability triggers at holdup around 0.014-0.019 — two orders
+of magnitude lower. Consistent with the documented mechanism (shear-
+driven Kelvin-Helmholtz growth vs. the gravity-restoring term in the flux
+Jacobian), just not something the existing sweep had evidence for across
+`U_sg`. Worth relaying to whichever session owns the solver's "KNOWN
+LIMITATION" docstring section, since it explicitly flagged this gap
+("only been characterized at `U_sg=5 m/s`, not swept across `U_sg`").
+
+Error pattern among the 11 clean conditions: holdup mixed-sign (3-55%
+magnitude, same "genuine model error" signature as MDPI); `dPdz`
+overwhelmingly one-directional under-prediction (10 of 11 conditions,
+-10% to -45%, only one outlier at +42%). One-directional bias is
+historically the Angeli-pipe-length-bug signature — but Fan (2005)'s
+`D`/`rho`/`mu`/`L` are read per-row straight from the CSV already (not a
+hand-set constant prone to a copy-paste mistake), and Fan (2005) is
+three to four orders of magnitude more extreme in liquid loading than
+MDPI, where the literature already shows 100-300% errors are normal (see
+above). Read as plausible genuine closure weakness (`f_i_mult` too weak),
+not a bug — but the one thing still worth double-checking later, same
+spirit as the MDPI geometry/property check above.
+
 **Explicitly deferred, tracked as its own checklist** (see Known Issues'
 "Vanishing-Phase Singularity Dominates..." entry and the module
 docstring's "KNOWN LIMITATION" section for the full reasoning): surface
