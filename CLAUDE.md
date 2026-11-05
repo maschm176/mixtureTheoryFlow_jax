@@ -20,7 +20,188 @@
 
 ---
 
-## Current Status
+## Project Overview
+
+This project has two parallel arms, both building reduced/two-fluid models
+of two-phase pipe flow in Python/JAX, validated against experimental data:
+
+- **Part 1: Oil-Water Two-Fluid Model** — the original arm. A `(phi1,
+  phi2)` two-fluid model validated against experimental data, with the
+  eventual goal of replacing the analytical interphase drag closure with
+  a physics-informed neural network (PINN). Sits at the intersection of:
+  - Computational fluid mechanics (two-fluid model, finite volume method)
+  - Scientific machine learning (physics-informed neural networks)
+  - Experimental validation (Ibarra et al. 2015 as the primary fitting
+    dataset; Russell, Hodgson & Govier 1959 and Angeli & Hewitt 1998 as
+    independent, zero-refit out-of-sample checks against different fluid
+    pairs and pipe geometries — see Part 1's References)
+
+- **Part 2: Reduced-Model Water-Gas Solver** — a newer, parallel arm (not
+  a replacement for Part 1), using a different state representation
+  (`alpha_l, Delta` instead of `phi1, phi2`) and numerics (central-upwind,
+  positivity-preserving) better suited to gas-liquid flow's much lower
+  liquid holdups, which broke Part 1's formulation (see Part 1's Known
+  Issues, "Vanishing-Phase Singularity Dominates..."). Calibrated against
+  Vuong (2016) oil-nitrogen data so far — see Part 2's own References for
+  Fan (2005) and Carraretto et al. (2020)/MDPI, the other two gas-liquid
+  datasets in use.
+
+See "Long-Term Vision: Virtual Flow Meter" below for how the two arms
+relate to the project's eventual goal.
+
+---
+
+## Long-Term Vision: Virtual Flow Meter (discussion, 2026-11-03)
+
+**The stated end goal**: learn the interaction/closure terms (interfacial
+friction, wall friction magnitude, drag) as a "catalog" organized by fluid
+pair and operating conditions, then run the forward solver with the
+appropriate catalog entry to predict how two phases will flow — velocities,
+holdup, pressure gradient — under new conditions (mixture velocity, pipe
+length, pressure, etc.). The ultimate application: a **virtual flow
+meter** — inferring phase flow rates without a physical multiphase meter.
+
+**This is a real, established technology category, not a novel framing.**
+Virtual flow metering is standard practice in oil & gas (especially
+subsea/offshore, where physical multiphase meters are expensive and
+fail often). The standard architecture matches what's being proposed
+here: a first-principles mechanistic model (Taitel-Dukler-style
+correlations, or a full 1D two-fluid solver like this project's) with a
+handful of tunable closure parameters, calibrated against available
+ground-truth measurements for a *specific* well/pipeline/fluid system,
+then run operationally.
+
+### Cross-fluid-pair generalization: what to expect
+
+Discussed in the context of whether a closure fit on one fluid pair
+(e.g. Vuong's oil-nitrogen) should be expected to transfer to a very
+different one (e.g. MDPI/Fan's water-air), given the new solver's
+cross-fluid-pair work (see "Reduced-Model Water-Gas Solver" below).
+
+- **`Re_g` (or more generally gas/liquid velocity and volume fraction)
+  is likely the right first-order controlling variable** — standard
+  dynamic-similarity reasoning: if two flows share the same relevant
+  dimensionless groups, the dimensionless physics should behave
+  similarly regardless of which specific fluids produced those numbers.
+  This is the logic behind Carraretto et al.'s own `f_i =
+  2.25*Re_SG^-0.53` correlation (already in this file), and it motivated
+  trying a `Re_g`-dependent power-law extension of `f_i_mult` (see
+  "Planned richer `f_i_mult` form" under Reduced-Model Water-Gas Solver).
+  Weak supporting evidence already in hand: MDPI (water-air) and Vuong
+  (oil-nitrogen) zero-refit runs both over-predict holdup in the *same
+  direction* — if the two fluid pairs' physics were totally unrelated,
+  that sign agreement would be a coincidence; getting it in both is a
+  (modest) sign of a shared underlying mechanism.
+- **But `Re_g` alone is very unlikely to be *sufficient* for magnitude
+  transfer**, because dynamic similarity needs *all* relevant
+  dimensionless groups to match, and water-air vs. oil-nitrogen differ
+  enormously on axes this solver doesn't represent at all:
+  | | water-air (MDPI/Fan) | oil-nitrogen (Vuong) |
+  |---|---|---|
+  | density ratio `rho_g/rho_l` | ~0.0012 | ~0.021-0.043 |
+  | viscosity ratio `mu_l/mu_g` | ~50 | ~70-100 |
+  | surface tension | ~0.07 N/m | ~0.024 N/m |
+  Density ratio alone is over an order of magnitude apart; surface
+  tension (which governs interfacial wave character — literally what
+  "stratified wavy" looks like) isn't wired into this solver's physics
+  at all yet (same gap flagged for the reduced-model solver's
+  high-holdup instability — see "KNOWN LIMITATION" in that section).
+- **Direct precedent from this project's own oil-water work argues
+  against expecting clean magnitude transfer**: the Ibarra-fitted `C_D`
+  tested zero-refit against Russell (same two fluid *types*, water and
+  oil, just a different, more viscous oil — 5.4 cp to 18 cp, density and
+  surface tension roughly fixed) got the *sign* right but was off by
+  225-1096% in *magnitude*. That's a much smaller single-property
+  perturbation than the simultaneous large shifts in density ratio,
+  viscosity ratio, and surface tension between water-air and
+  oil-nitrogen — so if anything, worse transfer should be expected here,
+  not better.
+- **A cheap, concrete, non-pooling test of this is already identifiable**:
+  once a `Re_g`-dependent exponent `alpha_fi` is fit on Vuong, compare it
+  against Carraretto's independently-derived `-0.53` exponent (fit on a
+  completely different fluid pair, water-air). If they land in the same
+  ballpark, that's real evidence the functional *shape* generalizes even
+  though the *magnitude* (prefactor) needs per-fluid-pair recalibration.
+  If wildly different (or opposite sign), that argues `Re_g` alone isn't
+  the right generalizing variable and density ratio / Weber number need
+  to enter the closure explicitly. Not yet done — blocked on actually
+  fitting the power-law form (not yet implemented as of this note).
+
+**Practical conclusion**: calibrating separately per fluid pair (already
+the chosen approach — no pooling across MDPI/Fan/Vuong) is the right call
+given this reasoning, not just a data-convenience compromise.
+
+### Virtual flow meter feasibility assessment
+
+The overall architecture (physics solver + calibrated closure catalog) is
+sound and matches industry practice — but two gaps separate "a validated
+forward solver with per-system calibrations" from an actual working
+virtual flow meter:
+
+1. **The "catalog" is a growing list of per-system calibrations, not a
+   continuous universal function.** Given the cross-fluid-pair
+   generalization discussion above, a new fluid pair very likely needs
+   its *own* real ground-truth calibration data before it can be trusted
+   — the catalog doesn't let you "pour in any new fluid pair and get a
+   trustworthy answer" the way a truly universal closure would. That's
+   still real, useful value (it's exactly what industry virtual meters
+   do — calibrated per-well, not universal), just a narrower claim than
+   "universal virtual flow meter." Practical reach is gated by how much
+   calibration data is available per new system, not by how clever the
+   functional form is.
+2. **Forward vs. inverse — the more important gap.** Everything
+   validated so far solves the *forward* problem: given known
+   `U_sl`/`U_sg` (or `WC`/`Um`), predict holdup/pressure gradient. A
+   virtual flow meter needs the *opposite*: given what's actually
+   measurable in the field (pressure drop, maybe total flow rate, known
+   fluid properties), infer the individual phase flow rates that
+   *aren't* directly measurable. This is a genuinely different
+   computational problem, not automatically solved by having a good
+   forward model, and can be ill-posed (multiple `U_sl`/`U_sg`
+   combinations might produce similar measurable signatures if only one
+   quantity like `dP/dL` is available to invert against). Two
+   implementation paths, neither built yet: (a) wrap the forward solver
+   in an optimization loop (guess the flow split, run forward, compare
+   to measured data, adjust — mechanically similar to the
+   closure-parameter fitting already done, just inverting for *operating
+   condition* instead of a *closure parameter*), or (b) train a fast
+   surrogate specifically for the inverse mapping, since re-running the
+   full transient PDE solve per real-time flow estimate would likely be
+   too slow operationally. Not yet designed — a distinct piece of future
+   work, not something the current forward-model validation delivers for
+   free.
+
+**Scope note**: everything calibrated so far (both solvers) is strictly
+within one flow regime (stratified or stratified-wavy) at a time. Real
+pipelines drift through multiple regimes (slug, annular, dispersed) as
+conditions change over time — this 1D model structurally can't represent
+those. A deployed meter would need either a regime classifier that knows
+when it's safely inside the validated envelope (flagging when it isn't)
+or separate closures per regime.
+
+**Overall verdict**: this is a reasonable, well-grounded way to frame the
+long-term goal, and the project's actual methodology — always checking
+zero-refit generalization before trusting it, explicitly excluding
+unreliable regimes (`kh_total`, `PHI_COLLAPSE`), documenting exactly
+where the model is and isn't validated — is unusually disciplined in a
+way well-suited to eventually producing something trustworthy, more so
+than jumping straight to a black-box regression would be. Better framing
+for the destination: **"a library of per-system, per-envelope calibrated
+virtual meters,"** not "one universal model." The forward→inverse step
+should be treated as its own future design task, not an automatic
+consequence of forward-model validation.
+
+---
+
+## Part 1: Oil-Water Two-Fluid Model
+
+The original project arm — see Part 2 below for the newer, parallel
+reduced-model water-gas solver. Everything from Current Status through
+this Part's own References is specific to this arm's `(phi1, phi2)`
+two-fluid formulation and its oil-water validation datasets (Ibarra,
+Russell, Angeli & Hewitt).
+
+### Current Status
 
 **MAJOR UPDATE (2026-09-02): a project-wide mu1/mu2 (water/oil viscosity) swap
 bug was found and fixed, invalidating the specific numeric values quoted
@@ -368,7 +549,7 @@ treatment whenever next touched.
 
 ---
 
-## Completed Phases
+### Completed Phases
 
 **Simulation development**
 - Built 1D two-fluid model with Lax-Friedrichs finite volume fluxes,
@@ -1268,167 +1449,9 @@ zero refitting, under corrected physics**
 
 ---
 
-## Project Overview
+### Simulation Overview
 
-This project develops a 1D two-fluid model for oil-water pipe flow in Python/JAX,
-validated against experimental data, with the eventual goal of replacing the
-analytical interphase drag closure with a physics-informed neural network (PINN).
-
-The work sits at the intersection of:
-- Computational fluid mechanics (two-fluid model, finite volume method)
-- Scientific machine learning (physics-informed neural networks)
-- Experimental validation (Ibarra et al. 2015 as the primary fitting
-  dataset; Russell, Hodgson & Govier 1959 and Angeli & Hewitt 1998 as
-  independent, zero-refit out-of-sample checks against different fluid
-  pairs and pipe geometries — see References)
-
----
-
-## Long-Term Vision: Virtual Flow Meter (discussion, 2026-11-03)
-
-**The stated end goal**: learn the interaction/closure terms (interfacial
-friction, wall friction magnitude, drag) as a "catalog" organized by fluid
-pair and operating conditions, then run the forward solver with the
-appropriate catalog entry to predict how two phases will flow — velocities,
-holdup, pressure gradient — under new conditions (mixture velocity, pipe
-length, pressure, etc.). The ultimate application: a **virtual flow
-meter** — inferring phase flow rates without a physical multiphase meter.
-
-**This is a real, established technology category, not a novel framing.**
-Virtual flow metering is standard practice in oil & gas (especially
-subsea/offshore, where physical multiphase meters are expensive and
-fail often). The standard architecture matches what's being proposed
-here: a first-principles mechanistic model (Taitel-Dukler-style
-correlations, or a full 1D two-fluid solver like this project's) with a
-handful of tunable closure parameters, calibrated against available
-ground-truth measurements for a *specific* well/pipeline/fluid system,
-then run operationally.
-
-### Cross-fluid-pair generalization: what to expect
-
-Discussed in the context of whether a closure fit on one fluid pair
-(e.g. Vuong's oil-nitrogen) should be expected to transfer to a very
-different one (e.g. MDPI/Fan's water-air), given the new solver's
-cross-fluid-pair work (see "Reduced-Model Water-Gas Solver" below).
-
-- **`Re_g` (or more generally gas/liquid velocity and volume fraction)
-  is likely the right first-order controlling variable** — standard
-  dynamic-similarity reasoning: if two flows share the same relevant
-  dimensionless groups, the dimensionless physics should behave
-  similarly regardless of which specific fluids produced those numbers.
-  This is the logic behind Carraretto et al.'s own `f_i =
-  2.25*Re_SG^-0.53` correlation (already in this file), and it motivated
-  trying a `Re_g`-dependent power-law extension of `f_i_mult` (see
-  "Planned richer `f_i_mult` form" under Reduced-Model Water-Gas Solver).
-  Weak supporting evidence already in hand: MDPI (water-air) and Vuong
-  (oil-nitrogen) zero-refit runs both over-predict holdup in the *same
-  direction* — if the two fluid pairs' physics were totally unrelated,
-  that sign agreement would be a coincidence; getting it in both is a
-  (modest) sign of a shared underlying mechanism.
-- **But `Re_g` alone is very unlikely to be *sufficient* for magnitude
-  transfer**, because dynamic similarity needs *all* relevant
-  dimensionless groups to match, and water-air vs. oil-nitrogen differ
-  enormously on axes this solver doesn't represent at all:
-  | | water-air (MDPI/Fan) | oil-nitrogen (Vuong) |
-  |---|---|---|
-  | density ratio `rho_g/rho_l` | ~0.0012 | ~0.021-0.043 |
-  | viscosity ratio `mu_l/mu_g` | ~50 | ~70-100 |
-  | surface tension | ~0.07 N/m | ~0.024 N/m |
-  Density ratio alone is over an order of magnitude apart; surface
-  tension (which governs interfacial wave character — literally what
-  "stratified wavy" looks like) isn't wired into this solver's physics
-  at all yet (same gap flagged for the reduced-model solver's
-  high-holdup instability — see "KNOWN LIMITATION" in that section).
-- **Direct precedent from this project's own oil-water work argues
-  against expecting clean magnitude transfer**: the Ibarra-fitted `C_D`
-  tested zero-refit against Russell (same two fluid *types*, water and
-  oil, just a different, more viscous oil — 5.4 cp to 18 cp, density and
-  surface tension roughly fixed) got the *sign* right but was off by
-  225-1096% in *magnitude*. That's a much smaller single-property
-  perturbation than the simultaneous large shifts in density ratio,
-  viscosity ratio, and surface tension between water-air and
-  oil-nitrogen — so if anything, worse transfer should be expected here,
-  not better.
-- **A cheap, concrete, non-pooling test of this is already identifiable**:
-  once a `Re_g`-dependent exponent `alpha_fi` is fit on Vuong, compare it
-  against Carraretto's independently-derived `-0.53` exponent (fit on a
-  completely different fluid pair, water-air). If they land in the same
-  ballpark, that's real evidence the functional *shape* generalizes even
-  though the *magnitude* (prefactor) needs per-fluid-pair recalibration.
-  If wildly different (or opposite sign), that argues `Re_g` alone isn't
-  the right generalizing variable and density ratio / Weber number need
-  to enter the closure explicitly. Not yet done — blocked on actually
-  fitting the power-law form (not yet implemented as of this note).
-
-**Practical conclusion**: calibrating separately per fluid pair (already
-the chosen approach — no pooling across MDPI/Fan/Vuong) is the right call
-given this reasoning, not just a data-convenience compromise.
-
-### Virtual flow meter feasibility assessment
-
-The overall architecture (physics solver + calibrated closure catalog) is
-sound and matches industry practice — but two gaps separate "a validated
-forward solver with per-system calibrations" from an actual working
-virtual flow meter:
-
-1. **The "catalog" is a growing list of per-system calibrations, not a
-   continuous universal function.** Given the cross-fluid-pair
-   generalization discussion above, a new fluid pair very likely needs
-   its *own* real ground-truth calibration data before it can be trusted
-   — the catalog doesn't let you "pour in any new fluid pair and get a
-   trustworthy answer" the way a truly universal closure would. That's
-   still real, useful value (it's exactly what industry virtual meters
-   do — calibrated per-well, not universal), just a narrower claim than
-   "universal virtual flow meter." Practical reach is gated by how much
-   calibration data is available per new system, not by how clever the
-   functional form is.
-2. **Forward vs. inverse — the more important gap.** Everything
-   validated so far solves the *forward* problem: given known
-   `U_sl`/`U_sg` (or `WC`/`Um`), predict holdup/pressure gradient. A
-   virtual flow meter needs the *opposite*: given what's actually
-   measurable in the field (pressure drop, maybe total flow rate, known
-   fluid properties), infer the individual phase flow rates that
-   *aren't* directly measurable. This is a genuinely different
-   computational problem, not automatically solved by having a good
-   forward model, and can be ill-posed (multiple `U_sl`/`U_sg`
-   combinations might produce similar measurable signatures if only one
-   quantity like `dP/dL` is available to invert against). Two
-   implementation paths, neither built yet: (a) wrap the forward solver
-   in an optimization loop (guess the flow split, run forward, compare
-   to measured data, adjust — mechanically similar to the
-   closure-parameter fitting already done, just inverting for *operating
-   condition* instead of a *closure parameter*), or (b) train a fast
-   surrogate specifically for the inverse mapping, since re-running the
-   full transient PDE solve per real-time flow estimate would likely be
-   too slow operationally. Not yet designed — a distinct piece of future
-   work, not something the current forward-model validation delivers for
-   free.
-
-**Scope note**: everything calibrated so far (both solvers) is strictly
-within one flow regime (stratified or stratified-wavy) at a time. Real
-pipelines drift through multiple regimes (slug, annular, dispersed) as
-conditions change over time — this 1D model structurally can't represent
-those. A deployed meter would need either a regime classifier that knows
-when it's safely inside the validated envelope (flagging when it isn't)
-or separate closures per regime.
-
-**Overall verdict**: this is a reasonable, well-grounded way to frame the
-long-term goal, and the project's actual methodology — always checking
-zero-refit generalization before trusting it, explicitly excluding
-unreliable regimes (`kh_total`, `PHI_COLLAPSE`), documenting exactly
-where the model is and isn't validated — is unusually disciplined in a
-way well-suited to eventually producing something trustworthy, more so
-than jumping straight to a black-box regression would be. Better framing
-for the destination: **"a library of per-system, per-envelope calibrated
-virtual meters,"** not "one universal model." The forward→inverse step
-should be treated as its own future design task, not an automatic
-consequence of forward-model validation.
-
----
-
-## Simulation Overview
-
-### Governing Equations
+#### Governing Equations
 
 The simulation solves the two-fluid model — separate continuity and momentum
 equations for each phase (water = phase 1, oil = phase 2):
@@ -1446,7 +1469,7 @@ M1 = drag_coeff * (3/4) * (phi2*phi1*rho1/d_b) * |delta_u| * delta_u
 M2 = -M1
 ```
 
-### Numerical Methods
+#### Numerical Methods
 
 - **Mass/momentum equations**: Finite volume with Lax-Friedrichs flux
 - **Pressure solve**: Finite difference Thomas algorithm (tridiagonal solver)
@@ -1454,7 +1477,7 @@ M2 = -M1
 - **Time integration**: Forward Euler with fixed dt = 1e-4 s
 - **Time loop**: `jax.lax.scan` (converted from Python while loop for differentiability)
 
-### State Dictionary
+#### State Dictionary
 
 ```python
 state = {
@@ -1468,7 +1491,7 @@ state = {
 }
 ```
 
-### Key Physics Terms in advance_momentum
+#### Key Physics Terms in advance_momentum
 
 ```python
 mom1_new = mom1[1:-1]
@@ -1480,7 +1503,7 @@ mom1_new = mom1[1:-1]
          + dt * friction1        # wall friction (Darcy-Weisbach)
 ```
 
-### Drift Flux Correction in advance_mass
+#### Drift Flux Correction in advance_mass
 
 Added to capture phase redistribution due to slip between phases:
 
@@ -1497,7 +1520,7 @@ so phi1 increases — water accumulates as expected physically.
 
 ---
 
-## Physical Parameters (Ibarra et al. 2015)
+### Physical Parameters (Ibarra et al. 2015)
 
 ```python
 # Fluid properties — Exxsol D140 oil and water at 25°C
@@ -1531,7 +1554,7 @@ viscosity swap bug" under Completed Phases. Fixed as of 2026-09-02;
 
 ---
 
-## Simulation Time Loop Structure
+### Simulation Time Loop Structure
 
 Converted from Python while loop to `jax.lax.scan` for JAX differentiability.
 Two-phase approach:
@@ -1560,9 +1583,9 @@ Timing at N=500, dt=1e-4:
 
 ---
 
-## Validation
+### Validation
 
-### Experimental Dataset: Ibarra et al. (2015)
+#### Experimental Dataset: Ibarra et al. (2015)
 
 **Citation**: Ibarra R, Matar OK, Markides CN, Zadrazil I. "An experimental study
 of oil-water flows in horizontal pipes." BHR Group, 2015.
@@ -1578,7 +1601,7 @@ Water cut (WC):        what you pump IN  = phi1_inlet_bc  (you control this)
 In-situ holdup (psi):  what's IN the pipe = phi1_plateau  (physics determines this)
 ```
 
-### Validation Approach
+#### Validation Approach
 
 Primary validation (completed, ~7.2% MAE):
 - Input: dP/dL from Figure 10 → set as p_inlet - p_outlet / L
@@ -1590,7 +1613,7 @@ Secondary validation (holdup):
 - Output: phi1_plateau (in-situ water fraction)
 - Compare against: ψ from Figure 11
 
-### Mixture Velocity Definitions
+#### Mixture Velocity Definitions
 
 ```python
 # Volumetric (matches Ibarra's Q_T/A definition)
@@ -1604,7 +1627,7 @@ Um_mom  = (phi1*rho1*u1 + phi2*rho2*u2) / rho_mix
 Use volumetric definition when comparing against Ibarra — they set pump
 flow rates (volumetric), so Um = Q_T/A is their natural definition.
 
-### CSV Validation Structure
+#### CSV Validation Structure
 
 One CSV per mixture velocity:
 ```
@@ -1614,9 +1637,9 @@ u1_predicted, u2_predicted, Um_predicted_vol, Um_predicted_momentum
 
 ---
 
-## Key Physical Concepts
+### Key Physical Concepts
 
-### Holdup vs No-Slip
+#### Holdup vs No-Slip
 
 The gap between water cut (input) and holdup (measured) is the slip effect:
 ```
@@ -1628,7 +1651,7 @@ Oil moves faster → exits sooner → water accumulates → holdup > water cut.
 Your model must capture this. Currently phi1 is nearly insensitive to drag_coeff
 (0.001% change across 10,000x drag variation) — a known limitation.
 
-### Slip Velocity Sensitivity
+#### Slip Velocity Sensitivity
 
 Sensitivity check across 5 orders of magnitude of drag_coeff:
 ```
@@ -1640,7 +1663,7 @@ slip:  changes 3.2%    ← weakly sensitive — best available training signal
 Wall friction (~1,515 N/m³) dominates drag (~0.028 N/m³) by 54,000x,
 which is why bulk quantities are insensitive to drag changes.
 
-### Flow Regimes (Ibarra classification)
+#### Flow Regimes (Ibarra classification)
 
 ```
 SS:    stratified smooth         (low Um, any WC)
@@ -1653,7 +1676,7 @@ D:     fully dispersed
 
 Avoid WC ≈ 0.5 (phase inversion point) — pressure spikes, model breaks down.
 
-### Inversion Point
+#### Inversion Point
 
 At WC ≈ 0.5, oil and water compete for continuity. Neither is clearly
 continuous. Effective mixture viscosity spikes, pressure gradient peaks,
@@ -1661,14 +1684,14 @@ flow morphology is chaotic. No simple two-fluid model handles this well.
 
 ---
 
-## Neural Network: Drag Closure Learning
+### Neural Network: Drag Closure Learning
 
-### Research Goal
+#### Research Goal
 
 Replace the analytical drag closure M1 with a neural network that learns
 the true interphase momentum exchange from experimental data.
 
-### Three-Phase Plan
+#### Three-Phase Plan
 
 ```
 Phase 1:   synthetic data    → learn C_D scalar    → loss: slip velocity
@@ -1885,7 +1908,7 @@ confirming which of the two (resume scalar C_D refit, or go straight to
 learning M1) makes more sense now that the ceiling is far less binding.
 Not yet decided — see "Current active step" under Current Status.
 
-### Why Learn C_D First (Not Full M1)
+#### Why Learn C_D First (Not Full M1)
 
 Learning C_D_eff instead of M1 directly:
 - Network only needs to learn HOW drag varies, not the full functional form
@@ -1894,7 +1917,7 @@ Learning C_D_eff instead of M1 directly:
 - Better extrapolation — physics structure maintained outside training range
 - Much smaller learning problem for limited data (~30 points)
 
-### Network Architecture (Phase 1)
+#### Network Architecture (Phase 1)
 
 ```python
 class DragClosureNetwork(eqx.Module):
@@ -1928,7 +1951,7 @@ has no way to know it should scale up for a different viscosity; Re/We
 groups are the natural mechanism for a network to learn that dependence
 explicitly rather than being retuned per dataset.
 
-### Hard Physics Constraints in Architecture
+#### Hard Physics Constraints in Architecture
 
 ```python
 # C_D_eff > 0 always — via softplus output activation
@@ -1941,7 +1964,7 @@ M2 = -M1
 M1 = C_D_eff * (3/4) * (phi2*phi1*rho1/d_b) * |delta_u| * delta_u
 ```
 
-### Key Design Decisions
+#### Key Design Decisions
 
 **Why Equinox over PyTorch/Flax**:
 Simulation is in JAX. Gradients must flow from loss → simulation → network.
@@ -1956,7 +1979,7 @@ Better gradient flow than sigmoid, handles negative inputs unlike ReLU.
 Ensures C_D_eff > 0 always. Random init gives C_D_eff ≈ 0.693 (log(2)).
 Prevents negative drag during early training which would blow up simulation.
 
-### Training Infrastructure
+#### Training Infrastructure
 
 ```python
 # Gradient check — verify chain works before training
@@ -1971,7 +1994,7 @@ grad = jax.grad(loss_from_drag)(jnp.array(drag_coeff))
 # Negative: stronger drag → less slip (physically correct)
 ```
 
-### Loss Function (Phase 1)
+#### Loss Function (Phase 1)
 
 ```python
 def loss_fn(network, condition, n_window, dt_fixed, ...):
@@ -1998,7 +2021,7 @@ def loss_fn(network, condition, n_window, dt_fixed, ...):
 Why slip not phi1/Um: drag directly controls velocity difference between phases.
 phi1 and Um are dominated by wall friction (54,000x larger than drag force).
 
-### Training Loop Pattern
+#### Training Loop Pattern
 
 ```python
 for epoch in range(n_epochs):
@@ -2025,7 +2048,7 @@ for epoch in range(n_epochs):
         break   # exits outer loop only
 ```
 
-### Saving and Resuming
+#### Saving and Resuming
 
 ```python
 # Save both network and optimizer state
@@ -2046,7 +2069,7 @@ else:
     opt_state = optimizer.init(eqx.filter(network, eqx.is_array))
 ```
 
-### Stopping Training Gracefully (Jupyter)
+#### Stopping Training Gracefully (Jupyter)
 
 ```python
 # Run BEFORE training loop
@@ -2063,9 +2086,9 @@ controller.request_stop()
 
 ---
 
-## Known Issues and Open Questions
+### Known Issues and Open Questions
 
-### Current Limitation: Drag Insensitivity
+#### Current Limitation: Drag Insensitivity
 
 The dispersed bubble drag formulation with d_b=1e-3 produces a drag force
 ~54,000x smaller than wall friction. phi1 and Um are essentially insensitive
@@ -2081,7 +2104,7 @@ M1  = 0.5 * f_i * a_i * rho_mix * |delta_u| * delta_u
 # f_i = interfacial friction factor (what network would learn)
 ```
 
-### Current Limitation: Vanishing-Phase Singularity Bounds Usable WC Range
+#### Current Limitation: Vanishing-Phase Singularity Bounds Usable WC Range
 (independent of drag closure richness)
 
 Discovered while investigating a Phase 2a real condition (WC=0.1@Um=0.75)
@@ -2117,7 +2140,7 @@ WC=0.8@Um=0.5 was excluded from Phase 1's synthetic set for the same reason
 slip_pred away from 0) while permanently dragging the average loss up, since
 it can never be fit no matter what C_D is tried.
 
-### Current Limitation: Vanishing-Phase Singularity Dominates (Not Just
+#### Current Limitation: Vanishing-Phase Singularity Dominates (Not Just
 Bounds) Gas-Liquid Data
 
 Discovered during Phase 2g (gas-water generalization check). The
@@ -2179,13 +2202,13 @@ paper), or treat this as the forcing function to finally revisit the
 two-fluid formulation's vanishing-phase handling itself rather than
 continuing to patch around it per-dataset.
 
-### Drift Flux Sign
+#### Drift Flux Sign
 
 The drift flux currently uses `(u1 - u2)` which gives negative j_drift when
 oil is faster — causing phi1 to increase (correct). Earlier experiments with
 sign reversal caused phi1 to decrease (wrong direction). Current sign is correct.
 
-### Phase Labeling
+#### Phase Labeling
 
 Phase 1 = water (rho1=998, mu1=0.9e-3)
 Phase 2 = oil   (rho2=825, mu2=5.4e-3)
@@ -2201,7 +2224,135 @@ unnoticed the first time.
 
 ---
 
-## Reduced-Model Water-Gas Solver (Parallel Initiative, Not a Numbered Phase)
+### Code Structure
+
+```
+Section 1:  imports
+Section 2:  helper functions
+                make_grid, initial_conditions
+                lax_friedrichs_flux
+                advance_mass          ← includes drift flux correction
+                advance_momentum      ← includes drag, friction, gravity, viscosity
+                pressure_poisson_solve
+                project_velocities
+                apply_boundary_conditions
+                compute_dt, compute_diagnostics
+                time_step             ← existing, captures drag_coeff from scope
+
+Section 3:  neural network definitions
+                DragClosureNetwork    ← eqx.Module, 4→32→32→16→1, softplus output
+                build_network_inputs  ← 4 scaled dimensional inputs
+                time_step_learned     ← wrapper with explicit drag_c argument
+                loss_fn               ← slip-based loss, returns 4 aux values
+
+Section 4:  physical parameters
+Section 5:  initial conditions
+Section 6:  scan infrastructure
+                scan_step, run_spinup_full, run_chunk
+
+Section 7a: synthetic dataset generation
+                generate_synthetic_dataset()
+                conditions list (8 points: 4 WC × 2 Um)
+                slip_target = u2_mean - u1_mean (computed from existing dataset)
+
+Section 7b: training loop
+                DragClosureNetwork initialization (or load from checkpoint)
+                optax.adam optimizer
+                epoch loop with slip_err metric
+                TrainingController stop flag
+                final evaluation table
+
+Section 8:  plotting
+```
+
+---
+
+### References
+
+- Ibarra R, Matar OK, Markides CN, Zadrazil I (2015). "An experimental study
+  of oil-water flows in horizontal pipes." BHR Group.
+  → Primary validation dataset. 32mm horizontal pipe, Exxsol D140/water.
+  → Figure 10: pressure gradient. Figure 11: in-situ holdup (stratified only).
+
+- Beggs HD (1972). "An Experimental Study of Two-Phase Flow in Inclined Pipes."
+  PhD Dissertation, University of Tulsa.
+  → Air-water data. Used for initial validation of momentum physics.
+  → 584 tests, 1" and 1.5" pipe, 0° to ±90° inclination.
+
+- Nagoo AS. "Pipe Fractional Flow Theory: Principles and Applications."
+  PhD Dissertation, University of Texas.
+  → Theoretical framework. ANNA Global Pipe Flow Database.
+  → Not a two-fluid model — fractional flow / drift flux approach.
+
+- Arirachakaran et al. (1989). SPE-18836-MS.
+  → Oil-water horizontal pipe data. 1,200 data points. Future dataset for Phase 2f.
+
+- Trallero JL (1995). "Oil-Water Flow Pattern in Horizontal Pipes."
+  PhD Dissertation, University of Tulsa.
+  → Most comprehensive raw oil-water holdup dataset. Target for Phase 2f.
+
+- Taitel Y, Dukler AE (1976). Original stratified flow model paper — assumed
+  a *constant* ratio between interfacial and wall friction factor, since
+  identified in follow-up literature as the model's primary weakness.
+  → Base geometry this project's wall friction closure is derived from; see
+  "Wall friction upgrade: Taitel-Dukler stratified geometry" under
+  Completed Phases.
+
+- Rodriguez OMH, Oliemans RVA (2006). Two-fluid model errors for stratified
+  oil-water flow: 20-40% average, exceeding 100% in some cases; improved to
+  ~35% by incorporating interfacial wave roughness.
+  → Found via literature search (2026-08-18) confirming this project's own
+  Um/slip error magnitudes are typical for this model class, not a bug.
+  See "C_D refit surfaces a fundamental ceiling..." under Completed Phases.
+
+- Chakrabarti DP et al. (2005). Pressure gradient predictions for stratified
+  flow vary 40-200% depending on closure relations chosen (adapting
+  Brauner et al. 1998).
+  → Same literature search as above.
+
+- Ng TS, Lawrence CJ, Hewitt GF (2004). Oil-water equivalent wall/interfacial
+  friction factors described as "quite inconsistent" and "difficult to
+  formulate."
+  → Same literature search as above.
+
+- "Prediction of pressure gradient and hold-up in horizontal liquid-liquid
+  pipe flow" (2023), Petroleum Science.
+  → Reached -7.06% mean error (20.72% std) by modifying friction
+  correlations for oil viscosity, interfacial curvature, and phase fraction
+  jointly, rather than a single flat multiplier — reference point for how
+  far a well-designed closure can go beyond a simple k1/k2 correction.
+  https://www.sciencedirect.com/science/article/pii/S1995822623001681
+
+- Russell TWF, Hodgson GW, Govier GW (1959). "Horizontal pipeline flow of
+  mixtures of oil and water." Canadian Journal of Chemical Engineering,
+  February 1959.
+  → Second out-of-sample validation dataset. 1-inch transparent cellulose
+  acetate butyrate pipe, white mineral oil (18.0 cp, SG 0.834) and water
+  (0.894 cp) at 77°F, 28.18 ft test section. Provides both pressure-drop
+  and in-situ holdup measurements (via quick-closing valves), unlike
+  Angeli & Hewitt below. Used zero-refit (no dataset-specific tuning) to
+  test whether Ibarra-fitted w/k1/k2 generalize to a much more viscous oil
+  (18 cp vs. Ibarra's 5.4 cp) — see "Out-of-sample validation on Russell"
+  under Completed Phases.
+
+- Angeli P, Hewitt GF (1998). Pressure gradient data for horizontal
+  oil-water flow, stainless steel and acrylic pipes.
+  → Third validation dataset — same fluids (oil 801 kg/m³, 1.6 cp; water
+  998 kg/m³, 1.0 cp) run through two different pipe materials/diameters
+  (stainless steel 24.3mm, roughness 7e-5m; acrylic 24.0mm, roughness
+  1e-5m — note this project's friction closure has no roughness term, so
+  only acrylic is treated as directly comparable to Ibarra's setup). Pipe
+  length L=9.5m (acrylic) — unlike D/roughness/fluid properties, this is
+  NOT present in `angeli_hewitt_1998_pressure_gradient.csv` and was missing
+  from this file for most of the project; running Angeli validation without
+  it produced a real, documented false result (see the "Correction" note
+  under "Out-of-sample validation on Angeli & Hewitt").
+  Angeli's oil (1.6 cp) is less viscous than Ibarra's (5.4 cp) — the
+  opposite direction of extrapolation from Russell's more-viscous oil. See
+  "Out-of-sample validation on Angeli & Hewitt" under Completed Phases.
+---
+
+## Part 2: Reduced-Model Water-Gas Solver
 
 **Why this exists, and how it relates to Phase 2g**: Phase 2g (see Three-
 Phase Plan) zero-refit-tests the EXISTING, Ibarra-fitted closure (`phi1`/
@@ -2576,131 +2727,69 @@ AND dPdz -- final result (2026-11-05)**
   is worth a richer functional form before moving on to the other
   gas-liquid datasets (Fan 2005, MDPI) or other fluid pairs.
 
----
-
-## Code Structure
+### Code Structure
 
 ```
-Section 1:  imports
-Section 2:  helper functions
-                make_grid, initial_conditions
-                lax_friedrichs_flux
-                advance_mass          ← includes drift flux correction
-                advance_momentum      ← includes drag, friction, gravity, viscosity
-                pressure_poisson_solve
-                project_velocities
-                apply_boundary_conditions
-                compute_dt, compute_diagnostics
-                time_step             ← existing, captures drag_coeff from scope
+mixtureTheoryFlow_jax_solver_water_gas.py   -- the reduced-model solver itself
+    state: (alpha_l, Delta)
+    central-upwind / minmod / positivity-preserving numerics
+    Taitel-Dukler equilibrium holdup solve (custom_jvp), f_i_mult/k_wl/k_wg
+    run_real_data_condition()   -- runs one condition to steady state, returns diagnostics
 
-Section 3:  neural network definitions
-                DragClosureNetwork    ← eqx.Module, 4→32→32→16→1, softplus output
-                build_network_inputs  ← 4 scaled dimensional inputs
-                time_step_learned     ← wrapper with explicit drag_c argument
-                loss_fn               ← slip-based loss, returns 4 aux values
+mixtureTheoryFlow_water_air_jax.ipynb       -- sister notebook (gw-<dataset>- cell prefix)
+    zero-refit forward runs against MDPI, Fan (2005), Vuong (2016)
+    synthetic AD/gradient verification (gw-synthetic-ad-* cells)
 
-Section 4:  physical parameters
-Section 5:  initial conditions
-Section 6:  scan infrastructure
-                scan_step, run_spinup_full, run_chunk
-
-Section 7a: synthetic dataset generation
-                generate_synthetic_dataset()
-                conditions list (8 points: 4 WC × 2 Um)
-                slip_target = u2_mean - u1_mean (computed from existing dataset)
-
-Section 7b: training loop
-                DragClosureNetwork initialization (or load from checkpoint)
-                optax.adam optimizer
-                epoch loop with slip_err metric
-                TrainingController stop flag
-                final evaluation table
-
-Section 8:  plotting
+_vuong_fit_joint.py           -- orchestrator for the Vuong (2016) joint
+                                  (f_i_mult, k_wl, k_wg) fit (build_split,
+                                  eval_conditions, the Adam loop)
+_vuong_eval_worker.py         -- one-shot subprocess worker it dispatches
+                                  each 29-condition batch to
+_diag_percall_timing.py       -- per-condition timing/memory diagnostic;
+                                  cited by name in the two files above as
+                                  the evidence for the subprocess-per-batch design
+_vuong_eval_epoch5_detail.py  -- per-condition forward-solve evaluation at
+                                  a given parameter point (not just the
+                                  aggregate loss)
+vuong2016_sw_subset.csv       -- the Vuong (2016) pure-SW data, required
+                                  by the three scripts above
 ```
+
+See "Vuong (2016) joint (f_i_mult, k_wl, k_wg) calibration..." above for
+how these scripts fit together and why the subprocess-per-batch design is
+necessary — simplifying it back into a plain loop or a notebook cell
+would reintroduce the compile-cache memory blowup that design exists to
+avoid.
 
 ---
 
-## References
+### References
 
-- Ibarra R, Matar OK, Markides CN, Zadrazil I (2015). "An experimental study
-  of oil-water flows in horizontal pipes." BHR Group.
-  → Primary validation dataset. 32mm horizontal pipe, Exxsol D140/water.
-  → Figure 10: pressure gradient. Figure 11: in-situ holdup (stratified only).
+- Vuong NT (2016). TUFFP (Tulsa University Fluid Flow Projects)
+  stratified-wavy oil (Isopar L)-nitrogen data, 0.156m ID / 85m horizontal
+  pipe. Sourced from the FFPU-FilteredEntrainmentDatabase TUFFP
+  compilation (`vuong2016_sw_subset.csv`, filtered
+  `Fluids=='Nitrogen - Isopar L'`). Provides both in-situ liquid holdup
+  and pressure gradient for all 36 conditions — the only one of the three
+  gas-liquid datasets used so far with both measurements on every
+  condition. Used for the `f_i_mult`/`k_wl`/`k_wg` joint calibration — see
+  "Vuong (2016) joint ... calibration" above.
 
-- Beggs HD (1972). "An Experimental Study of Two-Phase Flow in Inclined Pipes."
-  PhD Dissertation, University of Tulsa.
-  → Air-water data. Used for initial validation of momentum physics.
-  → 584 tests, 1" and 1.5" pipe, 0° to ±90° inclination.
+- Fan Y (2005). Horizontal stratified-wavy gas-liquid subset (13
+  conditions) pulled from a larger literature compilation
+  (`fan2005_sw_subset.csv`, filtered `Authors=="Fan, Y."`,
+  `Flow Pattern=="SW"`). Used for a zero-refit forward check; 13/13
+  conditions sit at liquid holdup far below `PHI_COLLAPSE` (see Part 1's
+  Known Issues, "Vanishing-Phase Singularity Dominates...") — currently a
+  dead end for this closure as-is, pending Fan's inclined rows or a
+  higher-holdup alternative.
 
-- Nagoo AS. "Pipe Fractional Flow Theory: Principles and Applications."
-  PhD Dissertation, University of Texas.
-  → Theoretical framework. ANNA Global Pipe Flow Database.
-  → Not a two-fluid model — fractional flow / drift flux approach.
-
-- Arirachakaran et al. (1989). SPE-18836-MS.
-  → Oil-water horizontal pipe data. 1,200 data points. Future dataset for Phase 2f.
-
-- Trallero JL (1995). "Oil-Water Flow Pattern in Horizontal Pipes."
-  PhD Dissertation, University of Tulsa.
-  → Most comprehensive raw oil-water holdup dataset. Target for Phase 2f.
-
-- Taitel Y, Dukler AE (1976). Original stratified flow model paper — assumed
-  a *constant* ratio between interfacial and wall friction factor, since
-  identified in follow-up literature as the model's primary weakness.
-  → Base geometry this project's wall friction closure is derived from; see
-  "Wall friction upgrade: Taitel-Dukler stratified geometry" under
-  Completed Phases.
-
-- Rodriguez OMH, Oliemans RVA (2006). Two-fluid model errors for stratified
-  oil-water flow: 20-40% average, exceeding 100% in some cases; improved to
-  ~35% by incorporating interfacial wave roughness.
-  → Found via literature search (2026-08-18) confirming this project's own
-  Um/slip error magnitudes are typical for this model class, not a bug.
-  See "C_D refit surfaces a fundamental ceiling..." under Completed Phases.
-
-- Chakrabarti DP et al. (2005). Pressure gradient predictions for stratified
-  flow vary 40-200% depending on closure relations chosen (adapting
-  Brauner et al. 1998).
-  → Same literature search as above.
-
-- Ng TS, Lawrence CJ, Hewitt GF (2004). Oil-water equivalent wall/interfacial
-  friction factors described as "quite inconsistent" and "difficult to
-  formulate."
-  → Same literature search as above.
-
-- "Prediction of pressure gradient and hold-up in horizontal liquid-liquid
-  pipe flow" (2023), Petroleum Science.
-  → Reached -7.06% mean error (20.72% std) by modifying friction
-  correlations for oil viscosity, interfacial curvature, and phase fraction
-  jointly, rather than a single flat multiplier — reference point for how
-  far a well-designed closure can go beyond a simple k1/k2 correction.
-  https://www.sciencedirect.com/science/article/pii/S1995822623001681
-
-- Russell TWF, Hodgson GW, Govier GW (1959). "Horizontal pipeline flow of
-  mixtures of oil and water." Canadian Journal of Chemical Engineering,
-  February 1959.
-  → Second out-of-sample validation dataset. 1-inch transparent cellulose
-  acetate butyrate pipe, white mineral oil (18.0 cp, SG 0.834) and water
-  (0.894 cp) at 77°F, 28.18 ft test section. Provides both pressure-drop
-  and in-situ holdup measurements (via quick-closing valves), unlike
-  Angeli & Hewitt below. Used zero-refit (no dataset-specific tuning) to
-  test whether Ibarra-fitted w/k1/k2 generalize to a much more viscous oil
-  (18 cp vs. Ibarra's 5.4 cp) — see "Out-of-sample validation on Russell"
-  under Completed Phases.
-
-- Angeli P, Hewitt GF (1998). Pressure gradient data for horizontal
-  oil-water flow, stainless steel and acrylic pipes.
-  → Third validation dataset — same fluids (oil 801 kg/m³, 1.6 cp; water
-  998 kg/m³, 1.0 cp) run through two different pipe materials/diameters
-  (stainless steel 24.3mm, roughness 7e-5m; acrylic 24.0mm, roughness
-  1e-5m — note this project's friction closure has no roughness term, so
-  only acrylic is treated as directly comparable to Ibarra's setup). Pipe
-  length L=9.5m (acrylic) — unlike D/roughness/fluid properties, this is
-  NOT present in `angeli_hewitt_1998_pressure_gradient.csv` and was missing
-  from this file for most of the project; running Angeli validation without
-  it produced a real, documented false result (see the "Correction" note
-  under "Out-of-sample validation on Angeli & Hewitt").
-  Angeli's oil (1.6 cp) is less viscous than Ibarra's (5.4 cp) — the
-  opposite direction of extrapolation from Russell's more-viscous oil. See
-  "Out-of-sample validation on Angeli & Hewitt" under Completed Phases.
+- Carraretto M, et al. (2020). Horizontal gas-liquid stratified flow
+  study (MDPI), 24m/60mm PMMA air-water test section, digitized from
+  Figures 6, 9, 10 (`mdpi_airwater_phase2g_dataset.csv`, 32 conditions).
+  The paper itself reports established two-fluid closures (Taitel-Dukler,
+  Ullman-Brauner) tested against this exact dataset show MAPE of
+  100-300% below `J_G`~0.9-1.3 m/s — useful context for interpreting this
+  project's own zero-refit error against it as expected-for-the-regime,
+  not a bug. Their own best-fit empirical correlation:
+  `f_i = 2.25*Re_SG^-0.53`.
