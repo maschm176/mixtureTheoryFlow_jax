@@ -1284,6 +1284,148 @@ The work sits at the intersection of:
 
 ---
 
+## Long-Term Vision: Virtual Flow Meter (discussion, 2026-11-03)
+
+**The stated end goal**: learn the interaction/closure terms (interfacial
+friction, wall friction magnitude, drag) as a "catalog" organized by fluid
+pair and operating conditions, then run the forward solver with the
+appropriate catalog entry to predict how two phases will flow — velocities,
+holdup, pressure gradient — under new conditions (mixture velocity, pipe
+length, pressure, etc.). The ultimate application: a **virtual flow
+meter** — inferring phase flow rates without a physical multiphase meter.
+
+**This is a real, established technology category, not a novel framing.**
+Virtual flow metering is standard practice in oil & gas (especially
+subsea/offshore, where physical multiphase meters are expensive and
+fail often). The standard architecture matches what's being proposed
+here: a first-principles mechanistic model (Taitel-Dukler-style
+correlations, or a full 1D two-fluid solver like this project's) with a
+handful of tunable closure parameters, calibrated against available
+ground-truth measurements for a *specific* well/pipeline/fluid system,
+then run operationally.
+
+### Cross-fluid-pair generalization: what to expect
+
+Discussed in the context of whether a closure fit on one fluid pair
+(e.g. Vuong's oil-nitrogen) should be expected to transfer to a very
+different one (e.g. MDPI/Fan's water-air), given the new solver's
+cross-fluid-pair work (see "Reduced-Model Water-Gas Solver" below).
+
+- **`Re_g` (or more generally gas/liquid velocity and volume fraction)
+  is likely the right first-order controlling variable** — standard
+  dynamic-similarity reasoning: if two flows share the same relevant
+  dimensionless groups, the dimensionless physics should behave
+  similarly regardless of which specific fluids produced those numbers.
+  This is the logic behind Carraretto et al.'s own `f_i =
+  2.25*Re_SG^-0.53` correlation (already in this file), and it motivated
+  trying a `Re_g`-dependent power-law extension of `f_i_mult` (see
+  "Planned richer `f_i_mult` form" under Reduced-Model Water-Gas Solver).
+  Weak supporting evidence already in hand: MDPI (water-air) and Vuong
+  (oil-nitrogen) zero-refit runs both over-predict holdup in the *same
+  direction* — if the two fluid pairs' physics were totally unrelated,
+  that sign agreement would be a coincidence; getting it in both is a
+  (modest) sign of a shared underlying mechanism.
+- **But `Re_g` alone is very unlikely to be *sufficient* for magnitude
+  transfer**, because dynamic similarity needs *all* relevant
+  dimensionless groups to match, and water-air vs. oil-nitrogen differ
+  enormously on axes this solver doesn't represent at all:
+  | | water-air (MDPI/Fan) | oil-nitrogen (Vuong) |
+  |---|---|---|
+  | density ratio `rho_g/rho_l` | ~0.0012 | ~0.021-0.043 |
+  | viscosity ratio `mu_l/mu_g` | ~50 | ~70-100 |
+  | surface tension | ~0.07 N/m | ~0.024 N/m |
+  Density ratio alone is over an order of magnitude apart; surface
+  tension (which governs interfacial wave character — literally what
+  "stratified wavy" looks like) isn't wired into this solver's physics
+  at all yet (same gap flagged for the reduced-model solver's
+  high-holdup instability — see "KNOWN LIMITATION" in that section).
+- **Direct precedent from this project's own oil-water work argues
+  against expecting clean magnitude transfer**: the Ibarra-fitted `C_D`
+  tested zero-refit against Russell (same two fluid *types*, water and
+  oil, just a different, more viscous oil — 5.4 cp to 18 cp, density and
+  surface tension roughly fixed) got the *sign* right but was off by
+  225-1096% in *magnitude*. That's a much smaller single-property
+  perturbation than the simultaneous large shifts in density ratio,
+  viscosity ratio, and surface tension between water-air and
+  oil-nitrogen — so if anything, worse transfer should be expected here,
+  not better.
+- **A cheap, concrete, non-pooling test of this is already identifiable**:
+  once a `Re_g`-dependent exponent `alpha_fi` is fit on Vuong, compare it
+  against Carraretto's independently-derived `-0.53` exponent (fit on a
+  completely different fluid pair, water-air). If they land in the same
+  ballpark, that's real evidence the functional *shape* generalizes even
+  though the *magnitude* (prefactor) needs per-fluid-pair recalibration.
+  If wildly different (or opposite sign), that argues `Re_g` alone isn't
+  the right generalizing variable and density ratio / Weber number need
+  to enter the closure explicitly. Not yet done — blocked on actually
+  fitting the power-law form (not yet implemented as of this note).
+
+**Practical conclusion**: calibrating separately per fluid pair (already
+the chosen approach — no pooling across MDPI/Fan/Vuong) is the right call
+given this reasoning, not just a data-convenience compromise.
+
+### Virtual flow meter feasibility assessment
+
+The overall architecture (physics solver + calibrated closure catalog) is
+sound and matches industry practice — but two gaps separate "a validated
+forward solver with per-system calibrations" from an actual working
+virtual flow meter:
+
+1. **The "catalog" is a growing list of per-system calibrations, not a
+   continuous universal function.** Given the cross-fluid-pair
+   generalization discussion above, a new fluid pair very likely needs
+   its *own* real ground-truth calibration data before it can be trusted
+   — the catalog doesn't let you "pour in any new fluid pair and get a
+   trustworthy answer" the way a truly universal closure would. That's
+   still real, useful value (it's exactly what industry virtual meters
+   do — calibrated per-well, not universal), just a narrower claim than
+   "universal virtual flow meter." Practical reach is gated by how much
+   calibration data is available per new system, not by how clever the
+   functional form is.
+2. **Forward vs. inverse — the more important gap.** Everything
+   validated so far solves the *forward* problem: given known
+   `U_sl`/`U_sg` (or `WC`/`Um`), predict holdup/pressure gradient. A
+   virtual flow meter needs the *opposite*: given what's actually
+   measurable in the field (pressure drop, maybe total flow rate, known
+   fluid properties), infer the individual phase flow rates that
+   *aren't* directly measurable. This is a genuinely different
+   computational problem, not automatically solved by having a good
+   forward model, and can be ill-posed (multiple `U_sl`/`U_sg`
+   combinations might produce similar measurable signatures if only one
+   quantity like `dP/dL` is available to invert against). Two
+   implementation paths, neither built yet: (a) wrap the forward solver
+   in an optimization loop (guess the flow split, run forward, compare
+   to measured data, adjust — mechanically similar to the
+   closure-parameter fitting already done, just inverting for *operating
+   condition* instead of a *closure parameter*), or (b) train a fast
+   surrogate specifically for the inverse mapping, since re-running the
+   full transient PDE solve per real-time flow estimate would likely be
+   too slow operationally. Not yet designed — a distinct piece of future
+   work, not something the current forward-model validation delivers for
+   free.
+
+**Scope note**: everything calibrated so far (both solvers) is strictly
+within one flow regime (stratified or stratified-wavy) at a time. Real
+pipelines drift through multiple regimes (slug, annular, dispersed) as
+conditions change over time — this 1D model structurally can't represent
+those. A deployed meter would need either a regime classifier that knows
+when it's safely inside the validated envelope (flagging when it isn't)
+or separate closures per regime.
+
+**Overall verdict**: this is a reasonable, well-grounded way to frame the
+long-term goal, and the project's actual methodology — always checking
+zero-refit generalization before trusting it, explicitly excluding
+unreliable regimes (`kh_total`, `PHI_COLLAPSE`), documenting exactly
+where the model is and isn't validated — is unusually disciplined in a
+way well-suited to eventually producing something trustworthy, more so
+than jumping straight to a black-box regression would be. Better framing
+for the destination: **"a library of per-system, per-envelope calibrated
+virtual meters,"** not "one universal model." The forward→inverse step
+should be treated as its own future design task, not an automatic
+consequence of forward-model validation.
+
+---
+
 ## Simulation Overview
 
 ### Governing Equations
@@ -2133,37 +2275,105 @@ original sequence this is modeled on):
    large multi-paper compilation with known placeholder gaps in other
    columns).
 2. **Generate a synthetic dataset, confirm the AD framework works
-   end-to-end** — NOT YET DONE. Mirrors Phase 1's original goal for the
-   oil-water solver: verify `jax.grad` flows through the full timestep
-   back to a calibration parameter, using known-answer synthetic data,
-   before ever touching real data. The new solver already has two custom
-   `jax.custom_jvp` rules (`solve_taitel_dukler_holdup`, `h_l_of_alpha`)
-   built and verified in isolation via the implicit function theorem, but
-   end-to-end differentiability through a full `advance_state`/
-   `run_real_data_condition` call — the actual question Phase 1 answered
-   for the old solver — hasn't been checked yet for this one. Needs its
-   own synthetic-condition generator (known `f_i_mult`, run forward,
-   treat the output as a synthetic "measurement") and a gradient check
-   (`d(loss)/d(f_i_mult)` nonzero, correct sign) before any real-data fit
-   is trustworthy.
-3. **Calibrate real parameters against real data** — NOT YET DONE,
-   blocked on step 2. The new solver currently has exactly ONE
-   calibration knob, `f_i_mult` (interfacial friction multiplier, default
-   `1.0`, unmodified/uncalibrated) — structurally the same role as the
-   old solver's `w`, a multiplicative correction on the interfacial
-   friction term, not yet its own fitted value. Zero-refit (`f_i_mult=
-   1.0`) forward results already exist informally (from a parallel
-   session's own test, not yet reproduced in this notebook/pipeline):
-   holdup error ~46-47% mean on both datasets, pressure-gradient error
-   median -36% (Fan)/+4-8% (MDPI) — comparable in magnitude to the OLD
-   solver's own pre-calibration errors against Ibarra, consistent with
-   "this is what an uncalibrated closure looks like," not evidence of a
-   bug. Expect this to follow the same w → k1/k2 → C_D progression once
-   it starts: fit the one existing knob (`f_i_mult`) first, see what
-   error remains, then decide whether a second parameter (e.g. a
-   wall-friction-magnitude multiplier analogous to k1/k2) is needed
-   before reaching for anything richer (NN-learned, dimensionless-input
-   closure — Phase 2e/2f's eventual direction for the old solver).
+   end-to-end** — **DONE (2026-10-30), via a pivot to finite differences.**
+   Mirrors Phase 1's original goal for the oil-water solver: verify a
+   gradient flows through the full timestep back to a calibration
+   parameter, using known-answer synthetic data, before ever touching real
+   data. Picked a `kh_total=0` Fan (2005) condition (`i=0`:
+   `U_sl=0.018551`, `U_sg=15.110`, `D=0.0508`, `L=19.0`,
+   `rho_l=1000.0`/`rho_g=2.57`, `mu_l=1.0e-3`/`mu_g=1.8e-5`), ran it
+   forward at a deliberately-far-from-default `f_i_mult=2.0` (synthetic
+   "true" value), and used its `alpha_l_pred` as the synthetic target.
+   - **First attempt — `jax.grad`, OOM'd.** Added a differentiable sibling
+     function, `run_real_data_condition_differentiable` (same physics/
+     Strang-split timestep as `run_real_data_condition`, but returns raw
+     JAX scalars with zero `float()`/`int()`/`bool()` casts anywhere in
+     its body — under tracing, every scan output becomes a tracer once
+     `f_i_mult` is traced, not just the ones you'd expect, and casting any
+     of them mid-trace raises `ConcretizationTypeError`). Calling
+     `jax.grad` through its full ~60,206-step scan got the process
+     SIGKILL'd (exit 137) partway through — reverse-mode AD keeps every
+     intermediate activation across the whole trajectory alive for the
+     backward pass, with no `jax.checkpoint`/rematerialization added, so
+     memory scales with step count regardless of how small the per-step
+     state is. This is the exact same wall the old solver hit differentiating
+     through its own ~370,000-step scan for `w` — just reached at a smaller
+     step count here, consistent with this solver's richer per-step
+     computation (central-upwind flux, MUSCL reconstruction, Strang-split
+     implicit friction, KH-discriminant tracking) relative to the old
+     solver's simpler per-step physics.
+   - **Fix — central finite differences, no tape at all.** Rather than
+     reuse the differentiable sibling with a finite-difference wrapper
+     (which would still carry its unused-but-present AD machinery), the
+     check was rewritten to call the plain, already-working, non-
+     differentiable `run_real_data_condition` directly at `f_i_mult +/- h`
+     (`h=1e-3`) — no tape, no `custom_jvp` chain exercised, memory bounded
+     exactly like any ordinary forward run (confirmed: each full-condition
+     forward call took ~7-8s, no memory growth with step count). The
+     now-unused `run_real_data_condition_differentiable` was deleted from
+     the solver file rather than left dead — this project's established
+     practice (e.g. the old solver's `time_step`/`time_step_learned` split)
+     keeps a differentiable sibling only while it's actually earning its
+     complexity; here it never worked, so there was nothing to keep.
+   - **Stage 1 (single-point gradient check)**: central finite-difference
+     gradient at the initial guess (`f_i_mult=1.0`) came out to `-0.000190`,
+     with the correct sign — descending this gradient moves `f_i_mult`
+     toward the synthetic true value (`2.0`), confirming the chain from
+     `f_i_mult` through `advance_state`'s Taitel-Dukler-equilibrium/KH-
+     tracking/pressure-gradient machinery to `alpha_l_pred` responds
+     correctly and in the physically expected direction.
+   - **Stage 2 (15-epoch Adam recovery, log-space `z=log(f_i_mult)`,
+     `lr=0.1`, 3 forward evals/epoch — center, `+h`, `-h`)**: converged to
+     within ~2.3% of the true value at epoch 8 (`f_i_mult=2.046`,
+     loss≈5.3e-8, roughly three orders of magnitude below the starting
+     loss) before overshooting past it for the remaining epochs
+     (`f_i_mult=2.576` by epoch 14) — the same symptom the old solver's
+     `k1`/`k2` fit hit on its first attempt (lr too large for how sharply
+     the loss curves near its minimum), fixed there by lowering the
+     learning rate and adding best-epoch tracking. Not fixed here, since
+     this run's only purpose was verifying the machinery recovers the
+     right answer at all, which it clearly does (the near-exact minimum at
+     epoch 8 is the signal that matters) — tuning (lower lr, best-epoch
+     tracking) is deferred to the real Step 3 calibration below, where it
+     will actually matter for the reported fitted value.
+   - **Conclusion**: the AD/gradient-chain verification passes using
+     finite differences. `jax.grad` is not viable for this solver's
+     `f_i_mult` without either shortening the differentiated window (the
+     old solver's unexplored alternative) or adding checkpointing — not
+     attempted here, since finite differences already work cleanly and
+     cheaply (a handful of ~7s forward evals per gradient step, vs. an
+     OOM). Any future real-data `f_i_mult` fit (Step 3) should use the
+     same finite-difference pattern, not revisit `jax.grad`, unless a
+     specific reason emerges to need it (e.g. a future multi-parameter
+     closure where finite differences become asymptotically expensive).
+3. **Calibrate real parameters against real data** — NOT YET DONE, no
+   longer blocked (Step 2 confirmed the finite-difference gradient
+   pattern works). The new solver currently has exactly ONE calibration
+   knob, `f_i_mult` (interfacial friction multiplier, default `1.0`,
+   unmodified/uncalibrated) — structurally the same role as the old
+   solver's `w`, a multiplicative correction on the interfacial friction
+   term, not yet its own fitted value. Zero-refit (`f_i_mult=1.0`) forward
+   results already exist informally (from a parallel session's own test,
+   not yet reproduced in this notebook/pipeline): holdup error ~46-47%
+   mean on both datasets, pressure-gradient error median -36% (Fan)/+4-8%
+   (MDPI) — comparable in magnitude to the OLD solver's own
+   pre-calibration errors against Ibarra, consistent with "this is what an
+   uncalibrated closure looks like," not evidence of a bug. Expect this to
+   follow the same w → k1/k2 → C_D progression once it starts: fit the one
+   existing knob (`f_i_mult`) first, via the finite-difference pattern
+   just verified (not `jax.grad`, per Step 2's conclusion), see what error
+   remains, then decide whether a second parameter (e.g. a
+   wall-friction-magnitude multiplier analogous to k1/k2) is needed before
+   reaching for anything richer (NN-learned, dimensionless-input closure —
+   Phase 2e/2f's eventual direction for the old solver).
+   **Result (2026-11-05)**: fitting `f_i_mult` alongside a single wall-
+   friction multiplier surfaced an exact degeneracy (only their ratio is
+   identifiable from holdup alone), fixed by splitting wall friction into
+   independent per-phase `k_wl`/`k_wg` multipliers and adding dPdz to the
+   loss. Converged to `f_i_mult=1.3265, k_wl=0.7532, k_wg=1.3173`. See
+   "Vuong (2016) joint (f_i_mult, k_wl, k_wg) calibration..." below for the
+   full writeup, the debugging saga behind the execution architecture, and
+   how to reproduce it.
 
 **MDPI input verification (2026-10-30)**: before trusting the zero-refit
 run against MDPI, checked the constants in the driver cell
@@ -2243,6 +2453,128 @@ docstring's "KNOWN LIMITATION" section for the full reasoning): surface
 tension / KH regularization, re-sweeping across inclination and `U_sg`,
 re-verifying gradients once that's added, and only then lifting the Fan
 (2005) horizontal-only filter to include its other 47 (inclined) rows.
+
+**Vuong (2016) joint (f_i_mult, k_wl, k_wg) calibration against holdup
+AND dPdz -- final result (2026-11-05)**
+- Motivation: Step 3 above (calibrate `f_i_mult` against real data) was
+  attempted against Vuong (2016) first, not Fan/MDPI -- Vuong is the only
+  one of the three gas-liquid datasets with BOTH holdup and dPdz
+  measurements for every condition (`vuong2016_sw_subset.csv`, 36
+  stratified-wavy oil(Isopar L)-nitrogen conditions, 0.156m ID / 85m
+  horizontal pipe, filtered from the TUFFP FFPU compilation), and isn't
+  dominated by `PHI_COLLAPSE`/`kh_total` exclusions the way Fan/MDPI are.
+- **Degeneracy found, and why it blocked a holdup-only fit**: fitting
+  `f_i_mult` (interfacial friction) together with a single `k_wall`
+  multiplier (the wall-friction-magnitude analog of the old solver's
+  k1/k2, but applied identically to both phases) against holdup alone is
+  exactly degenerate -- only the ratio `f_i_mult/k_wall` is identifiable.
+  Confirmed two ways: (1) scaling `f_i_mult` and `k_wall` by the same
+  factor left `alpha_l_pred` unchanged across the dataset (opposite-signed
+  individual sensitivities that exactly cancel), and (2) `jax.grad` vs.
+  central finite-difference gradients of holdup w.r.t. the two parameters
+  agreed to ~1e-9 relative error, confirming the flat direction is real
+  physics, not a numerical artifact. Root cause: the equilibrium holdup
+  solve (`solve_taitel_dukler_holdup`) is a single force-balance equation
+  in one unknown (`alpha_l`) -- it has no way to separately identify two
+  friction-type multipliers from one scalar output.
+- **Fix**: split the single `k_wall` into independent per-phase `k_wl`
+  (liquid) and `k_wg` (gas) wall-friction multipliers -- threaded through
+  every function in the chain (`_wall_and_interfacial_shear`,
+  `stratified_momentum_source`, `taitel_dukler_residual`, `_bisect_ht`,
+  `solve_taitel_dukler_holdup` and its `custom_jvp` rule,
+  `dynamic_source_Delta`, `_implicit_friction_half_step`, `advance_state`,
+  `run_to_steady`, `estimate_stable_dt`, `predicted_pressure_gradient`,
+  `run_real_data_condition`) -- and added dPdz (pressure gradient) to the
+  loss alongside holdup. This breaks the degeneracy on two independent
+  fronts: the two phases' momentum balances now respond differently to
+  `k_wl` vs. `k_wg`, and dPdz gives a second measured target that doesn't
+  share holdup's exact flat direction. Verified via regression (defaults
+  `k_wl=k_wg=1.0` reproduce the old single-`k_wall` behavior exactly),
+  independence (opposite-signed holdup sensitivity to `k_wl` vs. `k_wg`),
+  and gradient correctness (`jax.grad` vs. finite difference, same ~1e-9
+  agreement as above) before being wired into the live fit.
+- **Train/test split**: the 36 conditions form 7 natural `U_sg` clusters
+  (gas rate swept at 5-6 liquid rates each). One condition per cluster is
+  held out as test, cycling which liquid-rate rank is held out across
+  clusters (`build_split()` in `_vuong_fit_joint.py`) so the 7-condition
+  test set still spans the full `U_sl`/`U_sg` range rather than
+  clustering at one corner. 29 train / 7 test, deterministic (no random
+  seed).
+- **Loss and optimization**: `mean(holdup_rel_err^2) + mean(dpdz_rel_err^2)`
+  (equal weight) over the 29 training conditions only (any condition with
+  `kh_total>0` excluded, same policy as every other fit in this project --
+  none were excluded here). Central finite-difference gradient in
+  log-space over all three parameters (7 forward evals/epoch: center +/-h
+  for each of `f_i_mult`, `k_wl`, `k_wg`), Adam(`lr=0.06`), best-epoch
+  tracking from the start.
+- **Execution architecture -- subprocess-per-batch, not a plain loop or
+  notebook cell, and why that matters**: an early plain-serial/
+  multiprocessing attempt (10 workers, then 4 workers with periodic
+  recycling) repeatedly exhausted memory via swap thrashing or hung
+  silently, even after a machine restart, even running fully serially in
+  one process. Root cause, isolated via a dedicated diagnostic
+  (`_diag_percall_timing.py`, kept in the repo specifically because both
+  `_vuong_fit_joint.py` and `_vuong_eval_worker.py` cite it by name in
+  their own docstrings as the evidence): `n_steps` (the static length
+  baked into `run_real_data_condition`'s `jax.lax.scan`) differs for
+  nearly every (condition, parameter) combination, so nearly every one of
+  the ~200+ calls a single epoch makes (7 finite-difference evals x 29
+  conditions) triggers a fresh, large XLA compile -- and JAX never evicts
+  a process's own compile cache. A clean, isolated batch of 29 calls at
+  one parameter point runs flat and fast (~230s, confirmed by
+  `_diag_percall_timing.py`), but accumulating many such batches inside
+  one long-lived process (whether multi-worker or plain serial)
+  eventually exhausts memory through allocator/compile-cache growth, not
+  a crash in the physics itself. **Fix**: tear the process down completely
+  after every single 29-condition batch and start fresh via `subprocess`
+  -- `_vuong_fit_joint.py` (orchestrator, never calls
+  `run_real_data_condition` directly) dispatches each batch to a brand-new
+  `python3 _vuong_eval_worker.py <f_i_mult> <k_wl> <k_wg> <split>` process,
+  waited on synchronously and collected before the next one starts. **Do
+  not simplify this back into a single in-process loop or paste it into a
+  Jupyter notebook cell** -- a long-lived kernel would silently reintroduce
+  the exact multi-hour memory blowup this architecture exists to avoid.
+- **Final result**: of a planned 30 epochs, the run was stopped manually
+  at epoch 19 once 13 consecutive epochs (6-18) failed to beat epoch 5 and
+  the loss had settled onto a flatter plateau (~0.047, vs. epoch 5's
+  0.0434) while `k_wg` was still visibly drifting -- judged unlikely to
+  find a new optimum given that trend, with best-epoch tracking meaning
+  nothing is lost by stopping early. **Best/final params: `f_i_mult=
+  1.3265, k_wl=0.7532, k_wg=1.3173`** (epoch 5), train loss=0.043427
+  (holdup=0.014280, dpdz=0.029147). Full per-condition forward-solve
+  evaluation at these params across all 36 conditions (`kh_total=0`
+  everywhere, no exclusions): **train (29): mean|holdup err|=9.90%,
+  mean|dpdz err|=14.41%; test (7, held out): mean|holdup err|=15.42%,
+  mean|dpdz err|=12.38%** -- dPdz actually generalizes slightly better on
+  test than train; test holdup error is mostly one outlier
+  (`U_sl=0.0100, U_sg=1.628`, -27.7%, the single worst error across all 36
+  conditions, either split). A systematic `U_sg`-dependent bias remains in
+  the holdup residuals (negative, -2% to -13%, at low `U_sg`~1.6-2.5 m/s;
+  increasingly positive, up to +25%, at high `U_sg`~3-4.4 m/s) -- read as a
+  likely functional-form limit of three flat multipliers rather than an
+  optimization shortfall, and the most direct motivation yet for the
+  `Re_g`-dependent power-law extension of `f_i_mult` already discussed
+  under "Cross-fluid-pair generalization" in Long-Term Vision above.
+- **How to reproduce**: needs `vuong2016_sw_subset.csv` and the
+  `k_wl`/`k_wg`-aware `mixtureTheoryFlow_jax_solver_water_gas.py` in the
+  working directory. Run `python3 _vuong_fit_joint.py` in the `jax` conda
+  env. At ~1610-1620s/epoch (one fresh subprocess per finite-difference
+  eval, 7 evals/epoch), the full 30 epochs takes ~13-14 hours, but since
+  the reported result was reached at epoch 5 and never improved on by
+  epoch 19, a fresh run only needs to go ~6-10 epochs to reproduce it, not
+  the full 30 -- watch the per-epoch `loss=` printout and stop once it's
+  clear the best epoch isn't improving. Writes a live checkpoint
+  (`vuong2016_joint_fit_full.pkl`, with `best_epoch`/`best_z_params`/
+  `best_loss` tracked every epoch) after each epoch. To re-evaluate a
+  specific parameter point per-condition (not just the aggregate loss),
+  see `_vuong_eval_epoch5_detail.py` (edit `F_I_MULT`/`K_WL`/`K_WG` at the
+  top for a different point) -- single-shot, ~36 forward calls, safe to
+  just run directly (well within the proven-clean scale above).
+- Not yet done: baking `f_i_mult=1.3265`/`k_wl=0.7532`/`k_wg=1.3173` in as
+  new solver defaults (same treatment `w`/`k1`/`k2` eventually got in the
+  old solver); deciding whether the residual `U_sg`-dependent holdup bias
+  is worth a richer functional form before moving on to the other
+  gas-liquid datasets (Fan 2005, MDPI) or other fluid pairs.
 
 ---
 
