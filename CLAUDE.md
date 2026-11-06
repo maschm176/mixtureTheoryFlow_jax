@@ -2525,6 +2525,14 @@ original sequence this is modeled on):
    "Vuong (2016) joint (f_i_mult, k_wl, k_wg) calibration..." below for the
    full writeup, the debugging saga behind the execution architecture, and
    how to reproduce it.
+   **Superseded (2026-11-06)**: this finite-difference fit was never
+   actually converged -- it was manually stopped at a plateau that turned
+   out to be a local resting point, not a minimum. A true-`jax.grad` fit
+   through the closed-form equilibrium path (see "Nondimensionalization +
+   equilibrium-path true-gradient training..." below) ran thousands of
+   epochs for roughly the same total cost and found a real, substantially
+   better optimum: `f_i_mult=3.8893, k_wl=1.5419, k_wg=0.8413`. This is
+   now the project's official Vuong calibration.
 
 **MDPI input verification (2026-10-30)**: before trusting the zero-refit
 run against MDPI, checked the constants in the driver cell
@@ -2607,6 +2615,14 @@ re-verifying gradients once that's added, and only then lifting the Fan
 
 **Vuong (2016) joint (f_i_mult, k_wl, k_wg) calibration against holdup
 AND dPdz -- final result (2026-11-05)**
+**SUPERSEDED (2026-11-06)** -- this finite-difference fit was stopped
+before it actually converged, not at a true optimum; see
+"Nondimensionalization + equilibrium-path true-gradient training
+supersedes the finite-difference joint fit" later in this section for the
+real converged values (`f_i_mult=3.8893, k_wl=1.5419, k_wg=0.8413`) now
+in official use. Kept below as historical record -- the degeneracy
+discovery, the k_wl/k_wg split, and the subprocess-architecture debugging
+saga are all still accurate and still relevant.
 - Motivation: Step 3 above (calibrate `f_i_mult` against real data) was
   attempted against Vuong (2016) first, not Fan/MDPI -- Vuong is the only
   one of the three gas-liquid datasets with BOTH holdup and dPdz
@@ -2815,6 +2831,125 @@ shared-k_wall degeneracy, to visually justify the k_wl/k_wg split
   `k_wall_only`'s remaining combined 2x2 figure should also be split to
   the same one-panel-per-file convention `f_i_mult_only`/`joint_fit`/
   `degeneracy` now use; baking any of this into solver defaults.
+  **Superseded by the finding below**: the f_i_mult-only epoch run did
+  complete (converged `f_i_mult=1.836` by its own 20-epoch budget, still
+  trending -- the same symptom the grid scan showed, confirmed not just
+  edge-pinning this time but genuine slow convergence), but its intended
+  purpose (comparing a 1-parameter true-gradient fit against the 3-
+  parameter joint fit) was overtaken by a much bigger finding: the joint
+  fit itself was not converged either, and a cheap way to fix that both at
+  once was found. See directly below.
+
+**Nondimensionalization + equilibrium-path true-gradient training
+supersedes the finite-difference joint fit (2026-11-06)**
+- Motivation: discussing why `f_i_mult`/`k_wl`/`k_wg` (like `w`/`k1`/`k2`
+  before them) needed finite-difference gradients instead of `jax.grad`
+  surfaced a question worth checking directly rather than assuming: does
+  the *dynamic* transient scan's final state actually need to be
+  differentiated at all for calibration purposes, or does the solver's
+  own independent closed-form equilibrium solver
+  (`solve_taitel_dukler_holdup`) -- which ALREADY has an exact
+  `@jax.custom_jvp` gradient via the implicit function theorem, no scan
+  involved, no finite differences needed -- give the same answer the
+  dynamic scan is validated to relax to?
+- **Cross-check (`_vuong_equilibrium_crosscheck.py`)**: ran both paths
+  (dynamic scan via `run_real_data_condition`, and the closed-form
+  equilibrium path via `solve_taitel_dukler_holdup` -> `td_geometry` ->
+  velocity recovery -> `predicted_pressure_gradient`) at the then-current
+  joint-fit parameters, across all 36 Vuong conditions. Agreement:
+  **0.0000% mean and max relative difference** in both holdup and dPdz --
+  essentially machine precision. Confirms the module docstring's general
+  "validated end-to-end against the independent steady Taitel-Dukler
+  equilibrium solver" claim directly, condition-by-condition, not just in
+  the abstract.
+- **Proof-of-concept true-`jax.grad` fit (`_vuong_fit_joint_equilibrium.py`)**:
+  refit `(f_i_mult, k_wl, k_wg)` with real backprop through the
+  equilibrium path (no scan, no finite differences) -- same loss/split as
+  `_vuong_fit_joint.py`, reused unchanged. First 100 epochs: the
+  trajectory matched the finite-difference fit's own epoch-by-epoch path
+  almost exactly (e.g. epoch 4: `f_i_mult=1.3266` here vs. the FD fit's
+  epoch-5 `1.3265`) -- strong direct confirmation the two training paths
+  share the same loss landscape, not just the same forward predictions.
+  Wall-clock: epoch 0 (including one-time JIT compile) took 827s; every
+  epoch after that took **0.5-1.0 millisecond** -- compare the
+  finite-difference fit's ~1610s/epoch. The real finding: loss kept
+  dropping well past epoch 19 (where the FD fit was manually stopped,
+  having looked plateaued), reaching a new low by epoch 99 that was still
+  trending down -- direct evidence the FD fit's reported "best" params
+  were a premature stop, not a converged optimum.
+- **Extended to 3000 epochs**: converged cleanly -- gradient components
+  are essentially exactly `0.0` from epoch ~1475 all the way through
+  epoch 2999 (not a noisy plateau, a real flat optimum). Total wall-clock
+  for all 3000 epochs: 756s, almost entirely the one-time compile.
+  **Result: `f_i_mult=3.8893, k_wl=1.5419, k_wg=0.8413`** (best epoch
+  2303), train loss=0.033699 (holdup=0.010319, dpdz=0.023380) -- well
+  below the old fit's loss=0.043427. Test-set evaluation (held-out, never
+  used in fitting): loss=0.042799 (holdup=0.022535, dpdz=0.020265).
+  Re-evaluating all 36 conditions via the DYNAMIC scan (not just the
+  equilibrium shortcut) at these new parameters, specifically to
+  re-confirm `kh_total` stability (never previously checked away from the
+  old parameter point): **all 36/36 remain `kh_total=0`** (stable), train
+  mean|hld_err%|=8.55 (was 9.90), mean|dpdz_err%|=13.49 (was 14.41); test
+  mean|hld_err%|=**11.69** (was 15.42 -- a real improvement, not just
+  lower training error), mean|dpdz_err%|=12.74 (was 12.36, about the
+  same). Adopted as the project's official Vuong calibration -- see the
+  "Superseded" note on the old finite-difference result above.
+- **Physical interpretation, not yet investigated**: this is a
+  substantively different point, not a small correction -- `f_i_mult`
+  nearly 3x higher, and the `k_wl`/`k_wg` relationship flips (previously
+  `k_wg > k_wl`, gas friction amplified more; now `k_wl > k_wg`, the
+  reverse). Not yet understood physically; flagged for later, not blocking
+  adoption given the clean convergence and genuine test-error improvement.
+- **Nondimensionalization**, done as part of the same pass (originally
+  planned as separate future work, pulled forward because it was the
+  natural moment -- see the now-resolved discussion in this session about
+  sequencing it after the equilibrium-path approach was confirmed):
+  added `compute_nondim_scales(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g,
+  g)` to the solver module -- reference scales `L_c=D`, `U_c=Q=U_sl+U_sg`
+  (already the solver's own pervasive fixed scalar, so this needed almost
+  no new plumbing), `rho_c=rho_l`, `t_c=D/Q`, `P_c=rho_l*Q**2`.
+  **Noteworthy finding, confirmed both by hand derivation and numerically,
+  not assumed**: every physics function in this solver (`td_geometry`,
+  `recover_velocities`, `fanning_wall_shear`, `_wall_and_interfacial_
+  shear`, `stratified_momentum_source`, `physical_flux`, ...) is already
+  built purely from ratios/products of its own arguments, with `mu`/`g`
+  always plain parameters never mixed with a second embedded constant --
+  meaning feeding them *rescaled numeric values* for the SAME existing
+  arguments (`D->1.0`, `rho_l->1.0`, `rho_g->rho_g/rho_l`,
+  `mu_l->mu_l/(rho_l*Q*D)`, `mu_g->mu_g/(rho_l*Q*D)`, `g->g*D/Q**2`)
+  reproduces the correct dimensionless result with **zero changes to any
+  physics formula**. A stronger "free lunch" than the oil-water solver's
+  own nondimensionalization pass found (that project needed real edits to
+  its viscous-stress and gravity terms specifically). `run_real_data_
+  condition`'s PUBLIC signature is unchanged (still real SI units in/out)
+  -- the conversion happens entirely inside the function body via
+  `compute_nondim_scales`, with `dPdz`/`dt` converted back to SI units
+  only at the return. Also added `Re_SL = rho_l*U_sl*D/mu_l`,
+  `Re_SG = rho_g*U_sg*D/mu_g` as new output fields -- the literature-
+  standard gas-liquid convention (matches Carraretto's own `Re_SG`,
+  chosen over referencing both phases off one shared velocity/density
+  specifically so a future `Re_g`-dependent closure can be compared
+  against Carraretto's `f_i=2.25*Re_SG^-0.53` directly -- see Long-Term
+  Vision). Note these are NOT what's threaded into the internal friction
+  formulas (that's necessarily referenced to `Q`, the solver's own shared
+  velocity scale, forced by `(alpha_l, Delta)` combining both phases'
+  velocities in one equation) -- they're purely reportable/derived,
+  future NN-input candidates.
+  **Validated** (`_validate_nondim.py`): loaded the pre-refactor solver
+  (via `git show` of the prior commit) and the refactored one side by
+  side in one process, ran both on a representative Vuong subset at the
+  new converged parameters. Agreement: **~1e-10 to 1e-11% relative** in
+  both holdup and dPdz -- essentially machine precision, confirming the
+  "zero formula change" result held in practice exactly as derived, not
+  just in theory.
+- Not yet done: investigating the `k_wl`/`k_wg` physical-interpretation
+  flip; deciding whether `_vuong_fit_joint.py` (the finite-difference
+  path) should be retired now that the equilibrium path is both exact and
+  dramatically cheaper, or kept as an independent cross-check method;
+  baking the new parameters in as solver defaults; extending the
+  equilibrium-path training approach to a future NN (weight count is no
+  longer a training-cost concern once true backprop is available, unlike
+  under finite differences).
 
 ### Code Structure
 
@@ -2862,6 +2997,24 @@ plot_vuong_wallonly.py        -- figures/k_wall_only/*.png
 plot_vuong_combined.py        -- figures/degeneracy/*.png
 plot_vuong_joint.py           -- figures/joint_fit/*.png (uses the already-
                                   known joint-fit data, no rerun needed)
+
+-- equilibrium-path true-gradient training, see "Nondimensionalization +
+   equilibrium-path true-gradient training..." above --
+compute_nondim_scales()       -- in mixtureTheoryFlow_jax_solver_water_gas.py;
+                                  boundary-conversion helper (dimensional
+                                  condition data -> reference scales),
+                                  used internally by run_real_data_condition
+_vuong_equilibrium_crosscheck.py -- dynamic scan vs. closed-form equilibrium
+                                     solver agreement check (all 36 conditions)
+_vuong_fit_joint_equilibrium.py  -- true-jax.grad (f_i_mult, k_wl, k_wg) fit
+                                     through the equilibrium path -- no scan,
+                                     no finite differences; current official
+                                     calibration source
+_vuong_eval_converged_detail.py  -- per-condition dynamic-scan evaluation
+                                     (incl. kh_total re-check) at the new
+                                     converged parameters
+_validate_nondim.py              -- pre- vs. post-nondimensionalization
+                                     side-by-side numerical validation
 
 figures/
     f_i_mult_only/   -- holdup/dpdz parity, error-vs-f_i_mult, residual

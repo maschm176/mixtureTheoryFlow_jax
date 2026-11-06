@@ -6,16 +6,22 @@ plot_vuong_fionly.py / plot_vuong_wallonly.py's layout for direct visual
 comparison across all three calibration stages (interfacial-only,
 wall-only, joint).
 
-Data is not re-run here -- it's the already-verified real output already
-used to add Vuong to figures/stage1_forward_stability.py:
-  - Per-condition values: fresh run of _vuong_eval_epoch5_detail.py at the
-    converged params (f_i_mult=1.3265, k_wl=0.7532, k_wg=1.3173, epoch 5),
-    all 36 conditions, kh_total=0 throughout. Matches CLAUDE.md's reported
-    9.90%/14.41% train and 15.42%/12.38% test holdup/dPdz error exactly.
-  - Per-epoch trajectory: the live _vuong_fit_joint.py run's own stdout
-    (epochs 0-19 before being stopped manually -- best epoch 5, loss
-    plateaued/noisy afterward; see CLAUDE.md "Vuong (2016) joint ...
-    calibration" for the full writeup of why it was stopped there).
+Data is not re-run here -- it's the already-verified real output from the
+NEW true-jax.grad fit through the closed-form equilibrium path
+(_vuong_fit_joint_equilibrium.py), which superseded the original
+finite-difference fit (f_i_mult=1.3265, k_wl=0.7532, k_wg=1.3173) once
+the equilibrium path was validated to reproduce the dynamic scan to
+~1e-10% (see CLAUDE.md "Nondimensionalization + equilibrium-path true-
+gradient training supersedes the finite-difference joint fit"):
+  - Per-condition values: fresh run of _vuong_eval_converged_detail.py
+    (the DYNAMIC scan, re-checking kh_total at the new parameters) at
+    f_i_mult=3.8893, k_wl=1.5419, k_wg=0.8413, all 36 conditions,
+    kh_total=0 throughout -- stability was never in question, but it was
+    only previously confirmed at the OLD parameters.
+  - Per-epoch trajectory: the 3000-epoch true-gradient run's own stdout,
+    thinned (dense through epoch 500, sparse afterward -- gradient is
+    essentially exactly zero from ~epoch 1475 onward, a real converged
+    optimum, not a plateau artifact). Best epoch 2303.
 
 Bottom-left panel replaces the other two figures' "error vs. scanned
 parameter" slot with loss vs. training epoch, since the joint fit has no
@@ -51,42 +57,42 @@ def apply_log_ticks(ax):
 
 # fields: split, U_sl, U_sg, psi_meas, psi_pred, dpdz_meas, dpdz_pred, kh_total
 ROWS = [
-    ("train", 0.0500, 1.620, 0.1501, 0.1468, 6.69, 5.44, 0),
-    ("train", 0.0200, 1.623, 0.0833, 0.0722, 5.20, 4.47, 0),
-    ("train", 0.0401, 1.625, 0.1360, 0.1244, 6.21, 5.14, 0),
-    ("train", 0.0301, 1.626, 0.1101, 0.0998, 5.48, 4.81, 0),
-    ("train", 0.0402, 2.379, 0.0882, 0.0922, 9.38, 9.56, 0),
-    ("train", 0.0303, 2.382, 0.0672, 0.0734, 8.20, 9.14, 0),
-    ("train", 0.0501, 2.396, 0.1045, 0.1090, 10.57, 10.07, 0),
-    ("train", 0.0202, 2.400, 0.0552, 0.0524, 7.28, 8.76, 0),
-    ("train", 0.0100, 2.417, 0.0314, 0.0285, 7.14, 8.36, 0),
-    ("train", 0.0200, 2.476, 0.0500, 0.0464, 12.38, 11.19, 0),
-    ("train", 0.0403, 2.479, 0.0791, 0.0829, 16.45, 12.20, 0),
-    ("train", 0.0302, 2.481, 0.0657, 0.0655, 14.13, 11.72, 0),
-    ("train", 0.0499, 2.482, 0.0907, 0.0980, 17.87, 12.69, 0),
-    ("train", 0.0401, 2.823, 0.0805, 0.0897, 8.10, 9.82, 0),
-    ("train", 0.0199, 2.828, 0.0503, 0.0506, 6.62, 8.90, 0),
-    ("train", 0.0099, 2.829, 0.0294, 0.0277, 6.31, 8.47, 0),
-    ("train", 0.0505, 2.844, 0.0960, 0.1069, 8.98, 10.37, 0),
-    ("train", 0.0501, 3.131, 0.0728, 0.0820, 21.60, 18.44, 0),
-    ("train", 0.0200, 3.132, 0.0361, 0.0381, 17.30, 16.63, 0),
-    ("train", 0.0300, 3.136, 0.0497, 0.0538, 18.66, 17.27, 0),
-    ("train", 0.0100, 3.138, 0.0217, 0.0208, 15.88, 16.10, 0),
-    ("train", 0.0201, 3.262, 0.0330, 0.0405, 14.40, 14.57, 0),
-    ("train", 0.0302, 3.264, 0.0458, 0.0570, 16.17, 15.17, 0),
-    ("train", 0.0401, 3.273, 0.0603, 0.0719, 17.23, 15.78, 0),
-    ("train", 0.0102, 3.288, 0.0195, 0.0223, 13.02, 14.14, 0),
-    ("train", 0.0100, 4.111, 0.0169, 0.0179, 19.84, 21.00, 0),
-    ("train", 0.0400, 4.387, 0.0509, 0.0637, 17.57, 19.50, 0),
-    ("train", 0.0200, 4.419, 0.0294, 0.0354, 15.35, 18.30, 0),
-    ("train", 0.0100, 4.439, 0.0175, 0.0191, 14.11, 17.78, 0),
-    ("test", 0.0100, 1.628, 0.0559, 0.0404, 3.52, 4.17, 0),
-    ("test", 0.0104, 2.457, 0.0256, 0.0265, 10.35, 10.62, 0),
-    ("test", 0.0300, 2.834, 0.0654, 0.0708, 7.35, 9.40, 0),
-    ("test", 0.0401, 3.134, 0.0616, 0.0684, 20.11, 17.86, 0),
-    ("test", 0.0501, 3.277, 0.0740, 0.0859, 18.29, 16.36, 0),
-    ("test", 0.0200, 4.114, 0.0275, 0.0330, 21.48, 21.68, 0),
-    ("test", 0.0300, 4.406, 0.0412, 0.0500, 16.43, 18.87, 0),
+    ("train", 0.0500, 1.620, 0.1501, 0.1460, 6.69, 5.93, 0),
+    ("train", 0.0200, 1.623, 0.0833, 0.0688, 5.20, 4.42, 0),
+    ("train", 0.0401, 1.625, 0.1360, 0.1224, 6.21, 5.46, 0),
+    ("train", 0.0301, 1.626, 0.1101, 0.0969, 5.48, 4.96, 0),
+    ("train", 0.0402, 2.379, 0.0882, 0.0892, 9.38, 9.74, 0),
+    ("train", 0.0303, 2.382, 0.0672, 0.0700, 8.20, 9.04, 0),
+    ("train", 0.0501, 2.396, 0.1045, 0.1065, 10.57, 10.49, 0),
+    ("train", 0.0202, 2.400, 0.0552, 0.0491, 7.28, 8.34, 0),
+    ("train", 0.0100, 2.417, 0.0314, 0.0259, 7.14, 7.50, 0),
+    ("train", 0.0200, 2.476, 0.0500, 0.0434, 12.38, 10.42, 0),
+    ("train", 0.0403, 2.479, 0.0791, 0.0799, 16.45, 12.12, 0),
+    ("train", 0.0302, 2.481, 0.0657, 0.0623, 14.13, 11.33, 0),
+    ("train", 0.0499, 2.482, 0.0907, 0.0955, 17.87, 12.89, 0),
+    ("train", 0.0401, 2.823, 0.0805, 0.0861, 8.10, 10.10, 0),
+    ("train", 0.0199, 2.828, 0.0503, 0.0471, 6.62, 8.55, 0),
+    ("train", 0.0099, 2.829, 0.0294, 0.0251, 6.31, 7.66, 0),
+    ("train", 0.0505, 2.844, 0.0960, 0.1037, 8.98, 10.92, 0),
+    ("train", 0.0501, 3.131, 0.0728, 0.0790, 21.60, 18.30, 0),
+    ("train", 0.0200, 3.132, 0.0361, 0.0353, 17.30, 15.19, 0),
+    ("train", 0.0300, 3.136, 0.0497, 0.0506, 18.66, 16.33, 0),
+    ("train", 0.0100, 3.138, 0.0217, 0.0188, 15.88, 13.93, 0),
+    ("train", 0.0201, 3.262, 0.0330, 0.0374, 14.40, 13.52, 0),
+    ("train", 0.0302, 3.264, 0.0458, 0.0536, 16.17, 14.60, 0),
+    ("train", 0.0401, 3.273, 0.0603, 0.0685, 17.23, 15.60, 0),
+    ("train", 0.0102, 3.288, 0.0195, 0.0201, 13.02, 12.42, 0),
+    ("train", 0.0100, 4.111, 0.0169, 0.0160, 19.84, 18.10, 0),
+    ("train", 0.0400, 4.387, 0.0509, 0.0600, 17.57, 19.28, 0),
+    ("train", 0.0200, 4.419, 0.0294, 0.0324, 15.35, 16.99, 0),
+    ("train", 0.0100, 4.439, 0.0175, 0.0171, 14.11, 15.59, 0),
+    ("test", 0.0100, 1.628, 0.0559, 0.0373, 3.52, 3.87, 0),
+    ("test", 0.0104, 2.457, 0.0256, 0.0242, 10.35, 9.38, 0),
+    ("test", 0.0300, 2.834, 0.0654, 0.0670, 7.35, 9.39, 0),
+    ("test", 0.0401, 3.134, 0.0616, 0.0652, 20.11, 17.35, 0),
+    ("test", 0.0501, 3.277, 0.0740, 0.0827, 18.29, 16.52, 0),
+    ("test", 0.0200, 4.114, 0.0275, 0.0303, 21.48, 19.74, 0),
+    ("test", 0.0300, 4.406, 0.0412, 0.0465, 16.43, 18.16, 0),
 ]
 split = np.array([r[0] for r in ROWS])
 U_sl = np.array([r[1] for r in ROWS])
@@ -98,21 +104,46 @@ dpdz_pred = np.array([r[6] for r in ROWS])
 herr = (psi_pred - psi_meas) / psi_meas * 100
 derr = (dpdz_pred - dpdz_meas) / dpdz_meas * 100
 
-# live _vuong_fit_joint.py run, epochs 0-19 (stopped manually; best=epoch 5)
-EPOCHS = np.arange(20)
-F_I_MULT = np.array([1.0000, 1.0618, 1.1265, 1.1931, 1.2604, 1.3265, 1.3895, 1.4473, 1.4980,
-                      1.5405, 1.5743, 1.5992, 1.6159, 1.6249, 1.6272, 1.6239, 1.6161, 1.6046,
-                      1.5904, 1.5745])
-LOSS = np.array([0.174014, 0.124628, 0.087816, 0.062882, 0.048727, 0.043427, 0.043909, 0.046593,
-                  0.048888, 0.049851, 0.049639, 0.048804, 0.047880, 0.047217, 0.046938, 0.046978,
-                  0.047148, 0.047225, 0.047021, 0.046428])
-LOSS_HLD = np.array([0.122244, 0.084082, 0.055481, 0.035213, 0.021947, 0.014280, 0.010774, 0.010058,
-                      0.010964, 0.012623, 0.014443, 0.016054, 0.017246, 0.017932, 0.018108, 0.017827,
-                      0.017177, 0.016264, 0.015195, 0.014075])
-LOSS_DPDZ = np.array([0.051770, 0.040547, 0.032335, 0.027670, 0.026781, 0.029147, 0.033135, 0.036535,
-                       0.037924, 0.037228, 0.035196, 0.032750, 0.030635, 0.029285, 0.028831, 0.029151,
-                       0.029971, 0.030962, 0.031826, 0.032353])
-BEST_EPOCH = 5
+# true-jax.grad fit through the closed-form equilibrium path (3000 epochs,
+# thinned: dense through epoch 500, sparse afterward -- flat/converged by
+# ~epoch 500, confirmed still exactly flat all the way to 2999)
+EPOCHS = np.array([
+    0, 25, 50, 75, 100, 125, 150, 175,
+    200, 225, 250, 275, 300, 325, 350, 375,
+    400, 425, 450, 475, 500, 600, 800, 1000,
+    1200, 1400, 1600, 1800, 2000, 2200, 2400, 2600,
+    2800, 2999,
+])
+F_I_MULT = np.array([
+    1.0618, 1.4637, 1.5916, 1.6913, 1.8436, 2.0373, 2.2629, 2.5161,
+    2.7841, 3.0482, 3.2869, 3.4837, 3.6317, 3.7343, 3.8005, 3.8407,
+    3.8638, 3.8765, 3.8831, 3.8864, 3.888, 3.8892, 3.8893, 3.8893,
+    3.8893, 3.8893, 3.8893, 3.8893, 3.8893, 3.8893, 3.8893, 3.8893,
+    3.8893, 3.8893,
+])
+LOSS = np.array([
+    0.174014, 0.038609, 0.037732, 0.037014, 0.036517, 0.035995, 0.035462, 0.034953,
+    0.034511, 0.03417, 0.033941, 0.033809, 0.033743, 0.033715, 0.033704, 0.0337,
+    0.033699, 0.033699, 0.033699, 0.033699, 0.033699, 0.033699, 0.033699, 0.033699,
+    0.033699, 0.033699, 0.033699, 0.033699, 0.033699, 0.033699, 0.033699, 0.033699,
+    0.033699, 0.033699,
+])
+LOSS_HLD = np.array([
+    0.122244, 0.010037, 0.010173, 0.010006, 0.010032, 0.010052, 0.010082, 0.010119,
+    0.01016, 0.010201, 0.010236, 0.010264, 0.010285, 0.010299, 0.010307, 0.010313,
+    0.010316, 0.010317, 0.010318, 0.010319, 0.010319, 0.010319, 0.010319, 0.010319,
+    0.010319, 0.010319, 0.010319, 0.010319, 0.010319, 0.010319, 0.010319, 0.010319,
+    0.010319, 0.010319,
+])
+LOSS_DPDZ = np.array([
+    0.05177, 0.028572, 0.02756, 0.027008, 0.026485, 0.025944, 0.02538, 0.024834,
+    0.024351, 0.02397, 0.023705, 0.023545, 0.023459, 0.023416, 0.023397, 0.023388,
+    0.023383, 0.023381, 0.02338, 0.02338, 0.02338, 0.02338, 0.02338, 0.02338,
+    0.02338, 0.02338, 0.02338, 0.02338, 0.02338, 0.02338, 0.02338, 0.02338,
+    0.02338, 0.02338,
+])
+BEST_EPOCH_IDX = len(EPOCHS) - 1   # 2999, last thinned point -- true best (2303) is indistinguishable (flat)
+BEST_EPOCH = 2303
 
 def new_ax(figsize=(6.2, 5.6)):
     fig, a = plt.subplots(figsize=figsize, facecolor='white')
@@ -164,7 +195,7 @@ a.plot(EPOCHS, LOSS, '-o', color=INK, lw=2, ms=5, label='total (holdup + dPdz)')
 a.plot(EPOCHS, LOSS_HLD, '-o', color=S1, lw=1.5, ms=4, label='holdup component')
 a.plot(EPOCHS, LOSS_DPDZ, '-o', color=S2, lw=1.5, ms=4, label='dPdz component')
 a.axvline(BEST_EPOCH, color=INK2, lw=1, ls='--')
-a.text(BEST_EPOCH, a.get_ylim()[1], f' best epoch {BEST_EPOCH}\n f_i_mult={F_I_MULT[BEST_EPOCH]:.3f}',
+a.text(BEST_EPOCH, a.get_ylim()[1], f' best epoch {BEST_EPOCH}\n f_i_mult={F_I_MULT[BEST_EPOCH_IDX]:.3f}',
        color=INK2, va='top', fontsize=9)
 a.set_xlabel('epoch', color=INK); a.set_ylabel('loss (mean squared rel. error)', color=INK)
 a.set_title('Joint fit convergence (f_i_mult, k_wl, k_wg)', color=INK, loc='left', fontsize=11)
@@ -194,9 +225,10 @@ for spine in ax_text.spines.values():
 lines = [
     'Final evaluation -- Vuong (2016) joint fit',
     '',
-    'Fitted: f_i_mult=1.3265  k_wl=0.7532  k_wg=1.3173',
-    f'  (converged epoch {BEST_EPOCH} of 20; run stopped manually at epoch 19',
-    '   after 13 epochs with no improvement over epoch 5)',
+    'Fitted: f_i_mult=3.8893  k_wl=1.5419  k_wg=0.8413',
+    f'  (true jax.grad through the equilibrium path -- no finite',
+    f'   differences, no dynamic scan. Converged by ~epoch 1475,',
+    f'   gradient exactly 0 from there on; best epoch {BEST_EPOCH})',
     '',
     f'Dataset: 36 conditions ({trm.sum()} train / {tem.sum()} test)',
     '         0 kh-excluded, 36/36 stable',

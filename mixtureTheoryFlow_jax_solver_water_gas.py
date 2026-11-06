@@ -1178,6 +1178,70 @@ def estimate_stable_dt(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, dx,
     return cfl * dx / speed
 
 
+def compute_nondim_scales(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, g=9.81):
+    """
+    Boundary-conversion layer: turns raw dimensional condition data into
+    the reference scales this solver is run in internally, plus two extra
+    reportable Reynolds numbers.
+
+    Reference scale convention (mirrors the oil-water solver's own
+    nondimensionalization pass -- see that project's "Nondimensionalization
+    of the core solver" writeup in CLAUDE.md -- adapted to this solver's
+    state):
+      L_c = D             (pipe diameter)
+      U_c = Q = U_sl+U_sg  (total superficial velocity -- already the
+                            single fixed scalar this solver threads through
+                            nearly every function, so this choice needs
+                            almost no new plumbing)
+      rho_c = rho_l        (liquid density, the denser/reference phase)
+      t_c = D/Q,  P_c = rho_l*Q**2  (stress/pressure-gradient scale)
+
+    A NOTEWORTHY property of this solver, confirmed by direct hand
+    derivation before this function was written: every formula downstream
+    of here (td_geometry, recover_velocities, fanning_wall_shear,
+    _wall_and_interfacial_shear, stratified_momentum_source, physical_flux,
+    ...) is ALREADY built purely from ratios/products of its own arguments,
+    with no embedded dimensional constant baked directly into any formula
+    (g and mu_l/mu_g are always plain PARAMETERS, never mixed with a second,
+    independent physical constant the way e.g. a hardcoded "9.81" would be).
+    That means none of those functions need ANY source edits to run
+    dimensionlessly -- feeding them the *_star values this function
+    returns, in place of the raw dimensional D/rho_l/rho_g/mu_l/mu_g/g
+    arguments they already accept, reproduces the correct dimensionless
+    result with the EXACT SAME formulas. This is a stronger "free lunch"
+    than the oil-water solver's own nondimensionalization pass found --
+    that project needed real formula edits for its viscous-stress and
+    gravity terms specifically. Verified numerically (not just by hand
+    derivation) by a dedicated before/after comparison script run
+    alongside this change -- see CLAUDE.md.
+
+    Re_SL/Re_SG use the literature-standard gas-liquid convention (each
+    phase referenced to its OWN density and OWN superficial velocity --
+    matches Carraretto et al.'s own Re_SG in f_i=2.25*Re_SG^-0.53, see
+    References) rather than referencing both phases off one shared
+    velocity/density. This is a DIFFERENT convention from mu_l_star/
+    mu_g_star above, which are necessarily referenced to Q (the solver's
+    own shared velocity scale, forced by the (alpha_l, Delta) state
+    combining both phases' velocities in one equation) -- Re_SL/Re_SG are
+    purely reportable/derived quantities (future NN-input candidates, and
+    the benchmark for comparing a future Re_g-dependent closure against
+    Carraretto's own fit), not what gets threaded into the internal
+    friction formulas.
+    """
+    Q = U_sl + U_sg
+    rho_g_star = rho_g / rho_l
+    mu_l_star = mu_l / (rho_l * Q * D)
+    mu_g_star = mu_g / (rho_l * Q * D)
+    g_star = g * D / Q**2
+    Re_SL = rho_l * U_sl * D / mu_l
+    Re_SG = rho_g * U_sg * D / mu_g
+    return {
+        'Q': Q, 'D_star': 1.0, 'rho_l_star': 1.0, 'rho_g_star': rho_g_star,
+        'mu_l_star': mu_l_star, 'mu_g_star': mu_g_star, 'g_star': g_star,
+        'P_c': rho_l * Q**2, 't_c': D / Q, 'Re_SL': Re_SL, 'Re_SG': Re_SG,
+    }
+
+
 def predicted_pressure_gradient(alpha_l, Delta, Q, D, rho_l, rho_g, mu_l, mu_g,
                                  f_i_mult=1.0, k_wl=1.0, k_wg=1.0, g=9.81, beta=0.0):
     """
@@ -1265,23 +1329,41 @@ def run_real_data_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
     the median can't recover a trustworthy value -- a genuine, open
     limitation of the friction closure itself, not something this
     diagnostic-side fix can paper over.
+
+    NONDIMENSIONALIZATION (added after the solver was first validated,
+    see CLAUDE.md): this function's PUBLIC signature is unchanged -- still
+    real SI units in, real SI units out -- but internally it now converts
+    to the dimensionless reference scales from compute_nondim_scales and
+    runs the scan/equilibrium-adjacent diagnostics entirely in those units,
+    converting dPdz and dt back to dimensional units only in the returned
+    dict. See compute_nondim_scales' docstring for why this needed zero
+    changes to any of the physics functions it calls.
     """
     Q = U_sl + U_sg
-    dx = L / N
-    dt = estimate_stable_dt(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, dx, f_i_mult,
-                             k_wl, k_wg, cfl, g=g, beta=beta)
-    t_end = n_transit_times * (L / Q)
-    n_steps = int(np.ceil(float(t_end / dt)))
+    nd = compute_nondim_scales(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, g)
+    U_sl_star, U_sg_star = U_sl / Q, U_sg / Q
+    rho_l_star, rho_g_star = nd['rho_l_star'], nd['rho_g_star']
+    mu_l_star, mu_g_star = nd['mu_l_star'], nd['mu_g_star']
+    g_star, D_star = nd['g_star'], nd['D_star']
+    L_star = L / D
+    dx_star = L_star / N
 
-    alpha_l_inlet = U_sl / Q
-    Delta_inlet   = (rho_l - rho_g) * Q
-    state = init_state_water_gas(N, U_sl, U_sg, rho_l, rho_g)
+    dt_star = estimate_stable_dt(U_sl_star, U_sg_star, D_star, rho_l_star, rho_g_star,
+                                  mu_l_star, mu_g_star, dx_star, f_i_mult,
+                                  k_wl, k_wg, cfl, g=g_star, beta=beta)
+    t_end_star = n_transit_times * L_star
+    n_steps = int(np.ceil(float(t_end_star / dt_star)))
+
+    alpha_l_inlet = U_sl_star
+    Delta_inlet_star = rho_l_star - rho_g_star
+    state = init_state_water_gas(N, U_sl_star, U_sg_star, rho_l_star, rho_g_star)
 
     def step(carry, _):
         state, kh_total, a_min, a_max = carry
         new_state, n_kh_faces = advance_state(
-            state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
-            alpha_l_inlet, Delta_inlet, g, f_i_mult, k_wl, k_wg, theta, beta
+            state, dt_star, dx_star, 1.0, D_star, rho_l_star, rho_g_star,
+            mu_l_star, mu_g_star, alpha_l_inlet, Delta_inlet_star, g_star,
+            f_i_mult, k_wl, k_wg, theta, beta
         )
         a_min = jnp.minimum(a_min, jnp.min(new_state['alpha_l']))
         a_max = jnp.maximum(a_max, jnp.max(new_state['alpha_l']))
@@ -1314,12 +1396,20 @@ def run_real_data_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
     # majority of cells already agree on.
     alpha_l_window = final_state['alpha_l'][-(outlet_window + 1):-1]
     Delta_window   = final_state['Delta'][-(outlet_window + 1):-1]
-    dPdz_l_arr, dPdz_g_arr = predicted_pressure_gradient(
-        alpha_l_window, Delta_window, Q, D, rho_l, rho_g, mu_l, mu_g, f_i_mult, k_wl, k_wg, g, beta
+    dPdz_l_arr_star, dPdz_g_arr_star = predicted_pressure_gradient(
+        alpha_l_window, Delta_window, 1.0, D_star, rho_l_star, rho_g_star,
+        mu_l_star, mu_g_star, f_i_mult, k_wl, k_wg, g_star, beta
     )
     alpha_l_outlet = jnp.median(alpha_l_window)
-    dPdz_l = jnp.median(dPdz_l_arr)
-    dPdz_g = jnp.median(dPdz_g_arr)
+    dPdz_l_star = jnp.median(dPdz_l_arr_star)
+    dPdz_g_star = jnp.median(dPdz_g_arr_star)
+
+    # Convert the dimensionless outlet diagnostics back to real SI units --
+    # the only place dPdz/dt re-enter dimensional units in this function.
+    dPdz_scale = nd['P_c'] / D   # Pa/m
+    dPdz_l = dPdz_l_star * dPdz_scale
+    dPdz_g = dPdz_g_star * dPdz_scale
+    dt = dt_star * nd['t_c']     # seconds
 
     any_nan = bool(jnp.any(jnp.isnan(final_state['alpha_l'])) or
                    jnp.any(jnp.isnan(final_state['Delta'])))
@@ -1334,4 +1424,6 @@ def run_real_data_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
         'dt': float(dt),
         'n_steps': n_steps,
         'any_nan': any_nan,
+        'Re_SL': nd['Re_SL'],
+        'Re_SG': nd['Re_SG'],
     }
