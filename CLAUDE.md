@@ -2727,6 +2727,95 @@ AND dPdz -- final result (2026-11-05)**
   is worth a richer functional form before moving on to the other
   gas-liquid datasets (Fan 2005, MDPI) or other fluid pairs.
 
+**Diagnostic figures: isolating f_i_mult-only, k_wall-only, and the
+shared-k_wall degeneracy, to visually justify the k_wl/k_wg split
+(2026-11-06)**
+- Motivation: the joint `(f_i_mult, k_wl, k_wg)` calibration above states
+  the degeneracy and its fix in prose; this follow-on work built the
+  actual supporting figures, so the "why k_wl/k_wg had to be split"
+  argument is visually self-contained rather than asserted -- mirroring
+  how the old solver's own `k1`/`k2` precedent motivated expecting
+  per-phase friction multipliers to matter here too.
+- Three independent grid scans, each varying only the parameter(s) named,
+  all reusing `_vuong_fit_joint.py`'s `build_split`/
+  `combined_loss_subprocess`/`eval_conditions_subprocess` unchanged (same
+  loss, same train/test split, same subprocess-per-batch architecture) so
+  every scan is directly comparable to the joint fit:
+  - **f_i_mult-only** (`_vuong_fionly_worker.py`/`_vuong_fionly_scan.py`/
+    `plot_vuong_fionly.py`, `k_wl=k_wg=1` fixed): 8-point log grid
+    (0.6-2.5). Best (lowest train holdup loss) landed at `f_i_mult=2.5`,
+    the grid's own upper edge -- error was still visibly decreasing
+    there, not plateaued, so this is evidence the tested range doesn't
+    contain a real optimum, not proof one doesn't exist.
+  - **k_wall-only** (`_vuong_wallonly_worker.py`/`_vuong_wallonly_scan.py`/
+    `plot_vuong_wallonly.py`, `f_i_mult=1` fixed, `k_wl=k_wg=k` shared):
+    same 8-point grid. Best landed at `k_wall=0.6`, the grid's own LOWER
+    edge -- same edge-pinning symptom, opposite direction.
+  - **Combined (shared k_wall) degeneracy** (`_vuong_combined_worker.py`/
+    `_vuong_combined_scan.py`/`plot_vuong_combined.py`): 5x5 grid over
+    `(f_i_mult, k_wall)`, evaluated on a fixed 9-condition representative
+    subset (`sorted(train+test, key=U_sg)[::4]`). The direct visual
+    counterpart to the degeneracy already proven analytically (see
+    "Degeneracy found..." above): a `log10(holdup loss)` heatmap
+    (`vuong_fi_kwall_degeneracy_heatmap.png`) shows an elongated diagonal
+    ridge rather than a localized minimum, and a 3-panel, one-row figure
+    (`vuong_fi_kwall_degeneracy_ratio.png`, one panel each at
+    `U_sg=1.62, 2.83, 4.39 m/s`) plots `alpha_l_pred` vs. the ratio
+    `f_i_mult/k_wall` for all 25 grid points, colored by `k_wall` -- every
+    point collapses onto a single curve as a function of the ratio alone,
+    regardless of the absolute `(f_i_mult, k_wall)` values that produced
+    it. Confirms the earlier algebraic/`jax.grad`-vs-finite-difference
+    degeneracy proof is visible in the actual solver output, not just in
+    the force-balance algebra.
+- **Important scoping correction made explicit during this work**: the
+  exact ratio-only degeneracy requires `k_wall` to ALSO be free. With
+  `k_wall` pinned at exactly 1.0 (the f_i_mult-only scan above), fitting
+  `f_i_mult` alone is an ordinary, well-posed 1-parameter problem (29
+  train conditions x 2 targets vs. 1 parameter) -- its edge-pinned grid
+  result is not proof of unidentifiability, only evidence that the tested
+  range (0.6-2.5) may not contain the true optimum, or that `f_i_mult`
+  achieves deceptively low training error by absorbing wall-friction's
+  share of the error into the wrong physical mechanism. The right test
+  for this is held-out TEST-set error (immune to "more flexibility fits
+  training better") plus a physical-plausibility comparison against
+  Carraretto's own `f_i=2.25*Re_SG^-0.53` correlation, not grid-edge
+  behavior alone.
+- **f_i_mult-only gradient-descent run** (`_vuong_fit_fionly.py`,
+  `k_wl=k_wg=1` fixed throughout): a genuine epoch-indexed companion to
+  the f_i_mult-only grid scan above, reusing `_vuong_fit_joint.py`'s exact
+  loss/split/subprocess machinery so it's directly comparable to the
+  joint fit, not a different methodology measuring a different thing.
+  `N_EPOCHS=20` (matched to the joint fit's actual stopping point, not its
+  unused planned 30), 3 forward-eval batches/epoch (center, +-h) since
+  there's only one free parameter, `lr=0.06`. **Launched 2026-11-06,
+  status as of this note: still running.** Through epoch 5, `f_i_mult`
+  was still climbing smoothly (1.00 -> 1.35) and loss was still dropping
+  smoothly (0.174 -> 0.100) with no plateau yet -- consistent with the
+  grid scan's edge-pinning, suggesting the true single-parameter optimum
+  (if the problem is in fact well-posed, per the scoping correction
+  above) sits beyond 2.5, not at it. Final best-epoch value, held-out
+  test-set error, and a direct comparison against the joint fit's
+  test-set error (the actual point of this run, per the correction above)
+  are not yet available -- **update this entry once
+  `vuong2016_fionly_fit_full.pkl` finishes.**
+- **Figures reorganized into subfolders under `figures/`** (previously
+  flat): `f_i_mult_only/` (4 standalone panels: holdup parity, dPdz
+  parity, error-vs-f_i_mult, holdup-residual-vs-U_sg), `k_wall_only/`
+  (one combined 2x2 figure, not yet split into standalone panels),
+  `degeneracy/` (heatmap + the 3-panel one-row ratio-collapse figure),
+  `joint_fit/` (4 standalone panels -- holdup, dPdz, convergence,
+  residual -- each now plain, with their repeated suptitle removed and
+  replaced by a single standalone `vuong_joint_fit_summary.png`
+  terminal-style "Final evaluation" text panel, styled to match
+  `stage2_synthetic_recovery.py`'s panel), `stage1/`, `stage2/` (moved
+  as-is). Every plotting script's `savefig` path was updated to match;
+  rerunning any of them writes back into the correct subfolder.
+- Not yet done: the f_i_mult-only epoch run's completion and resulting
+  write-up/comparison against the joint fit; deciding whether
+  `k_wall_only`'s remaining combined 2x2 figure should also be split to
+  the same one-panel-per-file convention `f_i_mult_only`/`joint_fit`/
+  `degeneracy` now use; baking any of this into solver defaults.
+
 ### Code Structure
 
 ```
@@ -2753,6 +2842,34 @@ _vuong_eval_epoch5_detail.py  -- per-condition forward-solve evaluation at
                                   aggregate loss)
 vuong2016_sw_subset.csv       -- the Vuong (2016) pure-SW data, required
                                   by the three scripts above
+
+-- single/combined-knob diagnostic scans, see "Diagnostic figures..." above --
+_vuong_fionly_worker.py       -- grid-scan worker: f_i_mult varied,
+_vuong_fionly_scan.py            k_wl=k_wg=1 fixed; caches to fionly_cache/
+_vuong_fit_fionly.py          -- epoch-indexed gradient-descent companion
+                                  to the f_i_mult-only scan (k_wl=k_wg=1
+                                  fixed); writes vuong2016_fionly_fit_full.pkl
+_vuong_wallonly_worker.py     -- grid-scan worker: k_wl=k_wg=k shared
+_vuong_wallonly_scan.py          varied, f_i_mult=1 fixed; caches to
+                                  wallonly_cache/
+_vuong_combined_worker.py     -- grid-scan worker: (f_i_mult, k_wall)
+_vuong_combined_scan.py          both varied (shared k_wall, the
+                                  pre-split parameterization), 5x5 grid on
+                                  a 9-condition subset; caches to
+                                  combined_cache/
+plot_vuong_fionly.py          -- figures/f_i_mult_only/*.png
+plot_vuong_wallonly.py        -- figures/k_wall_only/*.png
+plot_vuong_combined.py        -- figures/degeneracy/*.png
+plot_vuong_joint.py           -- figures/joint_fit/*.png (uses the already-
+                                  known joint-fit data, no rerun needed)
+
+figures/
+    f_i_mult_only/   -- holdup/dpdz parity, error-vs-f_i_mult, residual
+    k_wall_only/      -- single combined 2x2 figure (not yet split)
+    degeneracy/        -- loss heatmap + 3-panel ratio-collapse figure
+    joint_fit/          -- holdup/dpdz/convergence/residual + a standalone
+                           terminal-style summary panel
+    stage1/, stage2/    -- the two staged-plan figures and their scripts
 ```
 
 See "Vuong (2016) joint (f_i_mult, k_wl, k_wg) calibration..." above for
