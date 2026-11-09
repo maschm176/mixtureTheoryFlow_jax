@@ -2758,17 +2758,17 @@ shared-k_wall degeneracy, to visually justify the k_wl/k_wg split
   loss, same train/test split, same subprocess-per-batch architecture) so
   every scan is directly comparable to the joint fit:
   - **f_i_mult-only** (`_vuong_fionly_worker.py`/`_vuong_fionly_scan.py`/
-    `plot_vuong_fionly.py`, `k_wl=k_wg=1` fixed): 8-point log grid
+    `vuong_plots/plot_vuong_fionly.py`, `k_wl=k_wg=1` fixed): 8-point log grid
     (0.6-2.5). Best (lowest train holdup loss) landed at `f_i_mult=2.5`,
     the grid's own upper edge -- error was still visibly decreasing
     there, not plateaued, so this is evidence the tested range doesn't
     contain a real optimum, not proof one doesn't exist.
   - **k_wall-only** (`_vuong_wallonly_worker.py`/`_vuong_wallonly_scan.py`/
-    `plot_vuong_wallonly.py`, `f_i_mult=1` fixed, `k_wl=k_wg=k` shared):
+    `vuong_plots/plot_vuong_wallonly.py`, `f_i_mult=1` fixed, `k_wl=k_wg=k` shared):
     same 8-point grid. Best landed at `k_wall=0.6`, the grid's own LOWER
     edge -- same edge-pinning symptom, opposite direction.
   - **Combined (shared k_wall) degeneracy** (`_vuong_combined_worker.py`/
-    `_vuong_combined_scan.py`/`plot_vuong_combined.py`): 5x5 grid over
+    `_vuong_combined_scan.py`/`vuong_plots/plot_vuong_combined.py`): 5x5 grid over
     `(f_i_mult, k_wall)`, evaluated on a fixed 9-condition representative
     subset (`sorted(train+test, key=U_sg)[::4]`). The direct visual
     counterpart to the degeneracy already proven analytically (see
@@ -2951,6 +2951,157 @@ supersedes the finite-difference joint fit (2026-11-06)**
   longer a training-cost concern once true backprop is available, unlike
   under finite differences).
 
+**NN closure overfits on 29 points; a power-law f_i_mult(Re_SG) extension
+beats the flat fit instead, with a sign surprise (2026-11-08)**
+- Motivation: the fully-converged flat-scalar fit still shows a real,
+  non-artifact residual -- holdup error correlates with `U_sg` at
+  correlation=0.610 (see the equilibrium-path entry above), a genuine
+  functional-form limit of "one flat number per phase," not an
+  optimization shortfall. Two richer closures were tried.
+- **NN closure** (`_vuong_fit_nn_closure.py`, not yet committed): small
+  network, `(f_i_mult, k_wl, k_wg) = NN(log Re_SL, log Re_SG)`, 2->4
+  (tanh) -> 3 (softplus), 27 weights, warm-started to reproduce the
+  converged flat fit exactly at init (hidden->output weights zeroed,
+  output bias = inverse_softplus(flat-fit values)), trained via true
+  `jax.grad` through the equilibrium path (same machinery as the joint
+  fit above -- no scan, no finite differences). Result: severe
+  overfitting. Train loss dropped far below the flat fit's (0.0337 ->
+  0.0053) but test loss exploded (0.0428 -> 0.1013, worse than the flat
+  fit). Diagnosed mechanism: `k_wg` collapsed toward near-zero for most
+  conditions while `f_i_mult`/`k_wl` compensated with inflated values --
+  a local, per-condition version of the `f_i_mult`/`k_wall` ratio
+  degeneracy (see "Degeneracy found..." above), since 27 weights have
+  enough freedom to nearly independently fit each of only 29 training
+  points without a global consistency constraint. Network saved to
+  `vuong_nn_closure_best.eqx` (not committed). Decision: a smaller/more-
+  regularized architecture and a genuine train/validation split are
+  deferred to later, not pursued further in this pass.
+- **Power-law closure** (`_vuong_fit_fi_powerlaw.py`): a much more
+  parsimonious alternative, tried as a quick check before committing to
+  the NN remediation above. `f_i_mult = f0*exp(alpha_fi*(log(Re_SG) -
+  mean_log_Re_SG))`, `k_wl`/`k_wg` stay flat scalars -- 4 free parameters
+  total, directly comparable to Carraretto et al. (2020)'s own
+  `f_i=2.25*Re_SG^-0.53` correlation (already in this file's References).
+  Warm-started at `alpha_fi=0` (reduces exactly to the converged flat
+  fit at init), same true-`jax.grad`-through-equilibrium-path machinery,
+  3000 epochs. Converged cleanly by ~epoch 150 (loss dead flat through
+  epoch 2999, not a premature stop -- confirmed by inspecting the full
+  trajectory, not just early epochs). **Result: f0=5.5650,
+  alpha_fi=+0.6083, k_wl=2.1475, k_wg=0.5659**, train loss=0.027961
+  (holdup=0.010173, dpdz=0.017788), test loss=0.026653 (holdup=0.013547,
+  dpdz=0.013106) -- beats the flat fit on BOTH splits (train 0.0337,
+  test 0.0428), and test loss is even slightly below train loss, a good
+  sign of genuine rather than spurious improvement (unlike the NN).
+  `correlation(U_sg, holdup_err%)` dropped to **0.220** (from the flat
+  fit's 0.610), well past what the overfit NN achieved (0.281) despite
+  using 4 parameters instead of 27. Per-condition dynamic-scan
+  evaluation (`_vuong_eval_powerlaw_detail.py`, re-checking `kh_total`):
+  all 36/36 stable, train mean|hld_err%|=8.37 (dPdz=11.49), test
+  mean|hld_err%|=9.28 (dPdz=8.63). Of the 36 points, 25/36 (69%) land
+  within +-10% holdup error and 34/36 (94%) within +-20%; dPdz is
+  visibly harder to hit tightly (16/36, 44%, within +-10%; 29/36, 81%,
+  within +-20%). Figures: `vuong_plots/plot_vuong_powerlaw.py` ->
+  `figures/powerlaw_fit/` (holdup/dPdz parity, convergence, residual,
+  `f_i_mult` vs. `Re_SG` with Carraretto's exponent overlaid for shape
+  comparison, a 3-way model-comparison bar chart, and a summary panel).
+- **Sign surprise**: `alpha_fi` is POSITIVE here (`f_i_mult` increases
+  with `Re_SG`); Carraretto's own fit is NEGATIVE (`-0.53`, friction
+  decreases with `Re_SG`) -- opposite direction, not just a different
+  magnitude. Important nuance: `f_i_mult` is a multiplier on top of a
+  baseline formula that already has its own Re-dependence
+  (`_wall_and_interfacial_shear`: `f_g = 0.046*Re_g^-0.2`, the same
+  Blasius-type form used for wall friction) -- so the fair comparison
+  against Carraretto isn't `alpha_fi` alone, it's the NET effective
+  friction factor (baseline x multiplier) at the fitted equilibrium
+  states. Computed directly (regressing `log(f_i_mult * f_g)` against
+  `log(Re_SG)` across all 36 conditions): **net exponent ~= +0.41** --
+  the calibration doesn't just offset the baseline's built-in `-0.2`
+  decay, it overturns it. See "Weber number check..." directly below for
+  the physical investigation of why.
+- Not yet done (explicitly deferred by the user, not abandoned): the
+  smaller/regularized NN architecture, and a genuine train/validation
+  split carved out of the training set (distinct from the held-out test
+  set already in use) -- both flagged as "later" work, not pursued
+  further in this pass.
+
+**Weber number check confirms Vuong and MDPI sit in different
+interfacial-wave regimes -- explains the power-law fit's sign flip
+(2026-11-08)**
+- Motivation: is the power-law fit's sign-flipped `alpha_fi` (net
+  `Re_SG` exponent ~+0.41, vs. Carraretto's `-0.53`) explainable by a
+  real physical difference between the two fluid pairs, or is it just
+  noise/overfitting on 29 points? Stratified gas-liquid interfacial
+  friction is known (Andritsos & Hanratty 1987; already connected in
+  this file to Rodriguez & Oliemans (2006)'s "interfacial wave
+  roughness" fix) to have two qualitatively different regimes: a
+  smooth-interface regime where friction DECREASES with Re the way
+  ordinary turbulent wall friction does (Carraretto's regime), and a
+  wave-roughened regime, past a shear-driven onset, where growing
+  interfacial waves make friction INCREASE with Re instead. The
+  competition setting that onset is gas-phase inertia/shear (grows
+  interfacial waves) vs. surface tension (damps them) -- i.e. exactly a
+  Weber number, `We = rho_g*u_rel^2*D/sigma`.
+- Computed `We` at the REAL equilibrium-solved relative velocity
+  (`u_rel = u_g - u_l`, from `solve_taitel_dukler_holdup`/`td_geometry`,
+  not superficial velocities alone, since holdup sets the actual phase
+  velocities) for both datasets (`_vuong_mdpi_weber_check.py`):
+  - Vuong: evaluated at the fitted power-law closure above.
+    `sigma_vuong=0.024 N/m` (oil Isopar L - nitrogen, already in this
+    file's cross-fluid-pair table).
+  - MDPI: no fitted closure exists for this dataset yet (Phase 2g is
+    still blocked on the `PHI_COLLAPSE` issue -- see Known Issues), so
+    evaluated at the UNCALIBRATED default closure
+    (`f_i_mult=k_wl=k_wg=1.0`) -- an order-of-magnitude estimate, not a
+    precise fitted value. `sigma_waterair=0.072 N/m`.
+- **Result**: Vuong median `We=958` (range 336-1909, n=36); MDPI median
+  `We=3.7` (range 0.8-12.4, n=32) -- a ~259x gap in medians. MDPI sits
+  right at the `We~O(1)` transition where surface tension still
+  meaningfully competes with gas inertia (consistent with its own
+  dataset's flow-regime labels, several rows tagged "SS, near-2D-wavy" --
+  close to smooth, barely wavy). Vuong sits two to three orders of
+  magnitude higher, deep in the inertia-dominated regime, across its
+  ENTIRE tested range -- the calibration never gets to sample anything
+  resembling the smooth-interface regime at all.
+- **Decomposition of the gap** (`We = rho_g*u_rel^2*D/sigma`, four
+  multiplying factors, medians): gas density **20.1x**, relative
+  velocity squared 1.85x, pipe diameter 2.60x, inverse surface tension
+  3.00x (product 290x, close to the observed 259x gap in medians -- the
+  small discrepancy is expected since the decomposition uses median
+  factors separately rather than the ratio of medians directly). **Gas
+  density, not surface tension, is the dominant driver** -- Vuong's
+  median `rho_g~=24.2 kg/m3` is ~20x MDPI's `1.204 kg/m3`. Nitrogen and
+  air have nearly identical density at the same pressure/temperature (air
+  is already ~78% N2 by volume; molar masses ~28 vs ~29 g/mol), so this
+  isn't a gas-identity/chemistry effect -- it points to Vuong's facility
+  running at significantly elevated pressure. **Confirmed directly**
+  (2026-11-09): `vuong2016_sw_subset.csv` has its own `P[kPa]` column,
+  not previously inspected -- every condition in this dataset is at
+  **P=1535.5 kPa (~15.1 atm)**, matching the back-of-envelope ideal-gas
+  estimate (~20 atm) made from the gas density alone before this was
+  checked. No longer an inferred/unverified guess -- the elevated
+  pressure is directly documented in the dataset itself, consistent with
+  TUFFP flow loops commonly running at elevated pressure for
+  field-representative gas densities.
+- **Conclusion**: the sign flip isn't just "different fluids, different
+  numbers" -- the two datasets are probing genuinely different flow
+  physics regimes (MDPI near the surface-tension/inertia transition,
+  Vuong deep in shear-dominated territory throughout), which is a
+  coherent, literature-grounded explanation for why a calibration on one
+  would show the opposite `Re_SG`-trend from a calibration on the other.
+- Caveats: this is strong, data-grounded CONSISTENCY evidence (the
+  magnitude gap -- hundreds vs. single digits -- is hard to explain any
+  other way), not a direct confirmation of the wave-roughening mechanism
+  itself -- no actual wave-height/roughness measurement or validated
+  roughening-onset `We` threshold was checked against either dataset;
+  MDPI's `We` is from an uncalibrated closure (order-of-magnitude
+  estimate). The elevated-pressure explanation for WHY Vuong's gas
+  density is high is no longer a caveat -- see the confirmed `P=1535.5
+  kPa` finding above.
+- Figures: `vuong_plots/plot_vuong_mdpi_weber.py` -> `figures/weber_check/` (`We`
+  distribution by dataset with a `We=1` reference line and shaded
+  surface-tension-dominated region; the four-factor decomposition bar
+  chart).
+
 ### Code Structure
 
 ```
@@ -2992,10 +3143,10 @@ _vuong_combined_scan.py          both varied (shared k_wall, the
                                   pre-split parameterization), 5x5 grid on
                                   a 9-condition subset; caches to
                                   combined_cache/
-plot_vuong_fionly.py          -- figures/f_i_mult_only/*.png
-plot_vuong_wallonly.py        -- figures/k_wall_only/*.png
-plot_vuong_combined.py        -- figures/degeneracy/*.png
-plot_vuong_joint.py           -- figures/joint_fit/*.png (uses the already-
+vuong_plots/plot_vuong_fionly.py -- figures/f_i_mult_only/*.png
+vuong_plots/plot_vuong_wallonly.py -- figures/k_wall_only/*.png
+vuong_plots/plot_vuong_combined.py -- figures/degeneracy/*.png
+vuong_plots/plot_vuong_joint.py -- figures/joint_fit/*.png (uses the already-
                                   known joint-fit data, no rerun needed)
 
 -- equilibrium-path true-gradient training, see "Nondimensionalization +
@@ -3016,12 +3167,53 @@ _vuong_eval_converged_detail.py  -- per-condition dynamic-scan evaluation
 _validate_nondim.py              -- pre- vs. post-nondimensionalization
                                      side-by-side numerical validation
 
+-- richer-closure attempts (NN overfit, power-law succeeded), see
+   "NN closure overfits..." above --
+_vuong_fit_nn_closure.py         -- 27-weight NN closure fit (overfit,
+                                     not committed); writes
+                                     vuong_nn_closure_best.eqx
+_vuong_fit_fi_powerlaw.py        -- power-law f_i_mult(Re_SG) fit, true
+                                     jax.grad through the equilibrium
+                                     path; current best richer-closure result
+_vuong_eval_powerlaw_detail.py   -- per-condition dynamic-scan evaluation
+                                     (incl. kh_total re-check) at the
+                                     power-law fit's best parameters
+vuong_plots/plot_vuong_powerlaw.py -- figures/powerlaw_fit/*.png
+vuong_plots/plot_vuong_powerlaw_bands.py -- figures/powerlaw_fit/vuong_powerlaw_band_table.png
+                                     (+-10%/+-20% within-band counts, all/train/test)
+vuong_plots/plot_vuong_powerlaw_outliers.py -- figures/powerlaw_fit/vuong_powerlaw_outliers_map.png
+                                     (U_sl vs. U_sg operating map, holdup vs. dPdz
+                                     +-20% outliers highlighted separately)
+_vuong_fit_nn_cv.py               -- leave-one-cluster-out CV for a smaller
+                                     (15-weight), more regularized NN closure;
+                                     writes vuong_nn_cv_fold{0-6}.eqx (not committed)
+
+-- Weber number regime check, see "Weber number check..." above --
+_vuong_mdpi_weber_check.py       -- computes We for Vuong (fitted
+                                     power-law closure) and MDPI
+                                     (uncalibrated default closure),
+                                     plus the four-factor decomposition
+vuong_plots/plot_vuong_mdpi_weber.py -- figures/weber_check/*.png
+
+-- all Vuong plotting scripts live in vuong_plots/ (no cross-imports to the
+   solver or to each other -- each is self-contained, reading hardcoded data
+   tables and writing relative figures/<topic>/*.png paths, so they run fine
+   as `python3 vuong_plots/plot_vuong_*.py` from the repo root); the
+   computational fit/eval/worker scripts (_vuong_*.py) stay at the repo root,
+   since they import mixtureTheoryFlow_jax_solver_water_gas.py and each other
+   by bare module name and moving them would require sys.path surgery --
+
 figures/
     f_i_mult_only/   -- holdup/dpdz parity, error-vs-f_i_mult, residual
     k_wall_only/      -- single combined 2x2 figure (not yet split)
     degeneracy/        -- loss heatmap + 3-panel ratio-collapse figure
     joint_fit/          -- holdup/dpdz/convergence/residual + a standalone
                            terminal-style summary panel
+    powerlaw_fit/        -- holdup/dpdz/convergence/residual + f_i_mult
+                           vs. Re_SG + model-comparison bar chart +
+                           summary panel
+    weber_check/          -- We distribution comparison + factor
+                             decomposition bar chart
     stage1/, stage2/    -- the two staged-plan figures and their scripts
 ```
 
@@ -3044,6 +3236,19 @@ avoid.
   gas-liquid datasets used so far with both measurements on every
   condition. Used for the `f_i_mult`/`k_wl`/`k_wg` joint calibration — see
   "Vuong (2016) joint ... calibration" above.
+  **Isopar L**: ExxonMobil's synthetic isoparaffinic (branched-alkane)
+  solvent — a highly refined, narrow-boiling mixture, not a single pure
+  compound, essentially free of aromatics/sulfur. Used as a model "oil"
+  phase in multiphase-flow research specifically because its properties
+  are well-characterized and reproducible batch-to-batch, unlike real
+  crude oil. Per the dataset: ρ=760 kg/m³, μ=1.35 cP, σ=0.024 N/m —
+  notably lighter AND less viscous than the oils in any of Part 1's three
+  oil-water datasets (Ibarra 825 kg/m³/5.4 cP, Russell ~834 kg/m³/18 cP,
+  Angeli 801 kg/m³/1.6 cP), barely more viscous than water itself. The
+  dataset's own `P[kPa]` column shows every condition run at
+  **P=1535.5 kPa (~15.1 atm)** — confirms the facility ran at elevated
+  pressure (see "Weber number check..." above), not near-atmospheric like
+  MDPI/Carraretto's water-air data.
 
 - Fan Y (2005). Horizontal stratified-wavy gas-liquid subset (13
   conditions) pulled from a larger literature compilation

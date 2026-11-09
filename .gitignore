@@ -1,0 +1,17 @@
+# OS / editor cruft
+.DS_Store
+__pycache__/
+*.pyc
+
+# Excel lock files
+~$*
+
+# Scratch caches from grid-scan diagnostics (regenerable via their *_scan.py drivers)
+combined_cache/
+fionly_cache/
+wallonly_cache/
+*.log
+
+# Local Claude Code session/machine state (not project config)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
