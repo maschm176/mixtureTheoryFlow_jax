@@ -3187,6 +3187,17 @@ vuong_plots/plot_vuong_powerlaw_outliers.py -- figures/powerlaw_fit/vuong_powerl
 _vuong_fit_nn_cv.py               -- leave-one-cluster-out CV for a smaller
                                      (15-weight), more regularized NN closure;
                                      writes vuong_nn_cv_fold{0-6}.eqx (not committed)
+_vuong_eval_nn_detail.py          -- retrains the 27-weight NN closure with
+                                     full per-epoch loss logging, then runs
+                                     the dynamic-scan kh_total check per
+                                     condition (never done for this fit
+                                     before); all 36/36 stable
+vuong_plots/plot_vuong_nn.py      -- figures/nn_closure/*.png (holdup/dPdz
+                                     parity, convergence showing train/test
+                                     divergence, residual, a 3-panel
+                                     f_i_mult/k_wl/k_wg vs. Re_SG scatter
+                                     showing the ratio-degeneracy exploit,
+                                     model comparison, summary)
 
 -- Weber number regime check, see "Weber number check..." above --
 _vuong_mdpi_weber_check.py       -- computes We for Vuong (fitted
