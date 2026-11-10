@@ -236,6 +236,25 @@ a.set_title('Model comparison: flat vs. power-law vs. NN', color=INK, loc='left'
 a.legend(frameon=False)
 fig6.savefig('figures/nn_closure/vuong_nn_model_comparison.png', dpi=160, bbox_inches='tight')
 
+# --- figure 6b: NN-only train vs. test loss (same style as figure 6, but
+# isolating just this fit -- no flat/power-law bars -- so the train/test
+# gap is the only thing on the chart, not sharing axis scale with the
+# much smaller flat/power-law losses). Separate file, does not replace
+# figure 6's 3-way comparison. ---
+fig6b, a = new_ax(figsize=(4.6, 5.0))
+x = np.array([0])
+w = 0.32
+a.bar(x - w/2, [TRAIN_LOSS[2]], width=w, color=S1, label='train loss', zorder=3)
+a.bar(x + w/2, [TEST_LOSS[2]], width=w, color=S2, label='test loss', zorder=3)
+a.text(x[0] - w/2, TRAIN_LOSS[2] + 0.002, f'{TRAIN_LOSS[2]:.3f}', ha='center', fontsize=9, color=INK)
+a.text(x[0] + w/2, TEST_LOSS[2] + 0.002, f'{TEST_LOSS[2]:.3f}', ha='center', fontsize=9, color=INK)
+a.set_xticks(x); a.set_xticklabels(['27-weight NN'], color=INK)
+a.set_xlim(-0.6, 0.6)
+a.set_ylabel('loss (mean squared rel. error)', color=INK)
+a.set_title('NN closure: train vs. test loss', color=INK, loc='left', fontsize=11)
+a.legend(frameon=False)
+fig6b.savefig('figures/nn_closure/vuong_nn_only_comparison.png', dpi=160, bbox_inches='tight')
+
 # --- figure 7: terminal-style summary panel ---
 fig7 = plt.figure(figsize=(6.6, 5.4))
 ax_text = fig7.add_axes([0.06, 0.06, 0.88, 0.88])

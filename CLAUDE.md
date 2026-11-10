@@ -3102,6 +3102,137 @@ interfacial-wave regimes -- explains the power-law fit's sign flip
   surface-tension-dominated region; the four-factor decomposition bar
   chart).
 
+**"Option B" hybrid: NN for f_i_mult only (k_wl/k_wg stay flat scalars),
+beats the power law on loss but not on trend-tracking (2026-11-10)**
+- Motivation: every NN closure tried so far (`_vuong_fit_nn_closure.py`'s
+  27-weight net, its 15-weight leave-one-cluster-out CV variant) gave ONE
+  shared network authority over all three outputs (`f_i_mult`, `k_wl`,
+  `k_wg`) -- which is exactly what let it exploit the `f_i_mult`/`k_wall`
+  ratio degeneracy (`k_wg` collapsing toward 0 per-condition while
+  `f_i_mult`/`k_wl` compensate; see "NN closure overfits on 29 points..."
+  above). Open question: does `f_i_mult` alone benefit from NN-level
+  flexibility (vs. the power law's fixed 2-parameter form) WITHOUT
+  reintroducing that degeneracy exploit, if `k_wl`/`k_wg` are structurally
+  prevented from varying per-condition?
+- Design (`_vuong_fit_nn_fi_only.py`): `f_i_mult = NN(log Re_SL, log
+  Re_SG)`, a tiny `2 -> 3 (tanh) -> 1 (softplus)` network (13 weights),
+  bundled into a single `eqx.Module` (`HybridParams`) alongside `k_wl`/
+  `k_wg` as plain scalar leaves (log-space) -- NOT network outputs, no
+  functional dependence on the input features or condition identity. All
+  15 parameters trained JOINTLY (one `optax.adamw` optimizer over the
+  whole pytree), exactly mirroring `_vuong_fit_fi_powerlaw.py`'s structure
+  (same warm start -- network output bias set so `f_i_mult=3.8893`
+  regardless of input at init, `k_wl=1.5419`, `k_wg=0.8413` -- same true-
+  `jax.grad`-through-the-equilibrium-path machinery, same 29/7 train/test
+  split), just swapping the power law's 2-parameter form for a small
+  network on `f_i_mult` alone.
+- **Result**: converged (3000 epochs, `LR=0.02`, `weight_decay=1e-3`,
+  41.6s wall-clock) to **train loss=0.020799** (hld=0.008100,
+  dpdz=0.012698), **test loss=0.025095** (hld=0.009782, dpdz=0.015313).
+  Verified via the dynamic scan (`_vuong_eval_nn_fi_only_detail.py`,
+  re-checking `kh_total`): all 36/36 stable, train mean|hld_err%|=7.49/
+  mean|dpdz_err%|=9.54, test mean|hld_err%|=7.85/mean|dpdz_err%|=9.34.
+  `k_wl` drifted to 1.8613, `k_wg` to 0.7085 (modest, physically
+  plausible shifts from the flat fit's 1.5419/0.8413 -- nothing like the
+  full NN's near-collapse of `k_wg` toward ~0).
+  | Fit | params | train loss | test loss | train/test ratio | corr(U_sg, hld_err%) |
+  |---|---|---|---|---|---|
+  | flat 3-scalar | 3 | 0.0337 | 0.0428 | 1.3x | 0.610 |
+  | power-law `f_i_mult(Re_SG)` | 4 | 0.0280 | 0.0267 | 1.0x | 0.220 |
+  | **NN f_i_mult only (Option B)** | **15** | **0.0208** | **0.0251** | **1.2x** | **0.379** |
+  | 27-weight NN (all 3 outputs) | 27 | 0.0053 | 0.1042 | 20x | 0.283 |
+  Beats BOTH the flat fit and the power law on train AND test loss, with
+  a train/test ratio (1.2x) nowhere near the full NN's severe overfitting
+  (20x) -- direct confirmation that removing the network's authority over
+  `k_wl`/`k_wg` removes the degeneracy-exploit overfitting mechanism,
+  independent of how much freedom `f_i_mult` itself gets.
+- **But it's worse than the power law on the one metric that actually
+  motivated this whole line of work**: `corr(U_sg, holdup_err%)=0.379`
+  vs. the power law's `0.220` (flat fit: 0.610). The power law's smooth,
+  monotonic form tracks the systematic holdup-vs-gas-rate trend more
+  cleanly than this network's less-constrained shape, even though it
+  fits aggregate (mostly dPdz-driven) loss better. Per-condition
+  `f_i_mult` values show why: several repeat at nearly the same value
+  across visibly different `Re_SG` (e.g. ~4.19 recurring at `Re_SG`
+  from 334k to 429k), consistent with the tanh hidden units saturating
+  into a handful of effective regimes rather than varying smoothly --
+  fitting the right trend on average with more local noise than the
+  power law's clean curve.
+- **Consistency check, run directly rather than assumed**: does the NN
+  at least rediscover the power law's `Re_SG`-trend independently? Yes --
+  a log-log regression of the NN's own 36 `(Re_SG, f_i_mult)` points gives
+  `corr(log Re_SG, log f_i_mult)=0.745`, effective slope `~0.588` --
+  essentially identical to the power law's independently-fitted
+  `alpha_fi=+0.6083`. Two very different function classes (a 2-parameter
+  exponential vs. a 13-weight network), trained independently, landing on
+  the same exponent -- confirms the upward trend (opposite sign from
+  Carraretto's water-air `Re_SG^-0.53`, see "sign surprise" above) is a
+  real pattern in the data, not a power-law-specific artifact.
+- Figures: `vuong_plots/plot_vuong_nn_fi_only.py` -> `figures/nn_fi_only/`
+  (holdup/dPdz parity, convergence, residual, `f_i_mult` vs. `Re_SG` with
+  the power-law curve overlaid for comparison, four-way model comparison
+  bar chart including this result alongside flat/power-law/full-NN,
+  summary panel).
+
+**Forward roadmap, as discussed (2026-11-10): where NN-based closures fit
+relative to the power law going forward, and why neither "NN vs. power
+law" nor "more parameters is better" is the right frame in isolation.**
+The real lever for cross-fluid-pair generalization is WHICH DIMENSIONLESS
+INPUTS a closure sees, not whether its function class is a power law or a
+network -- `Re_SG` alone can't represent the sign flip between Vuong
+(`alpha_fi=+0.61`) and Carraretto's water-air correlation (`-0.53`)
+regardless of how flexible the function fitting it is, since the `We`-
+number regime story above is what actually distinguishes the two
+datasets, and neither fit currently sees `We`. Flexibility (NN or richer
+power law) only pays off once there's enough data to support it without
+overfitting -- exactly the axis Option A (the full NN, severely overfit
+on 29 points) vs. Option B (NN restricted to `f_i_mult` only, did not
+overfit) already demonstrates in miniature.
+- **Stage 1 (now)**: keep both the power law and the Option B hybrid as
+  parallel, documented results for Vuong-only calibration. Power law
+  remains the better PRODUCTION choice today (cleaner trend-tracking,
+  interpretable, directly comparable to Carraretto). Option B stands as
+  a validation data point (independently rediscovered the same exponent;
+  proof that excluding `k_wl`/`k_wg` from the network's authority
+  prevents the degeneracy exploit), not yet the right tool for this
+  specific job.
+- **Stage 2 (PDE work, already the agreed next step -- see "Linear and
+  nonlinear analysis..." discussion, 2026-11-10)**: implement surface
+  tension (then Reynolds stress) as a regularizing term in the governing
+  equations, re-run the inclination/holdup stability sweep. This is an
+  unlock of DATA, not of modeling technique -- it's what lets the 28
+  inclined ("ST") Vuong conditions found during the pooling discussion
+  (currently blocked by the same missing-surface-tension/KH-instability
+  issue) actually be used, instead of being stuck at 36 horizontal-only
+  points.
+- **Stage 3 (refit on the expanded, inclination-inclusive Vuong
+  dataset)**: re-run both the power law and the Option B hybrid on the
+  larger set once Stage 2 unlocks it. First point where the NN hybrid
+  gets a fairer test -- more conditions per parameter, and potentially
+  inclination-dependent structure a power law wouldn't represent unless
+  an inclination term were also hand-added to its form. Expect the
+  power-law/NN gap to narrow or flip.
+- **Stage 4 (cross-fluid-pair / pooled, We-extended closure)**: extend
+  closure inputs to `(Re_SL, Re_SG, We_SG, density ratio)` -- the
+  non-circular superficial `We_SG = rho_g*U_sg^2*D/sigma` already
+  designed during the pooling discussion -- and pool Vuong + MDPI (+ Fan
+  2005 once its `kh_total`/collapse issues are resolved; see Known
+  Issues). This is the stage where a flexible function conditioned on
+  `We` should genuinely start beating any hand-specified power law,
+  since representing a SIGN FLIP across regimes (smooth-interface MDPI
+  vs. wave-roughened Vuong) is exactly what a fixed-sign power law
+  structurally cannot do. Not the previously-scrapped pooled-`We`-
+  power-law idea revisited as-is -- a richer, NN-based version of it,
+  motivated now by concrete evidence (the sign flip itself, Option B's
+  independent trend-confirmation) rather than a speculative one, and
+  deliberately sequenced AFTER Stage 2/3 rather than before.
+- **Methodological discipline to carry through all four stages**: keep
+  `k_wl`/`k_wg` out of any network's authority unless there's specific
+  evidence wall friction also needs richer dependence -- the one design
+  choice that has cleanly prevented overfitting every time it's been
+  tried in this investigation (Option B vs. the full NN), no reason to
+  abandon it just because the dataset grows.
+
 ### Code Structure
 
 ```
@@ -3198,6 +3329,25 @@ vuong_plots/plot_vuong_nn.py      -- figures/nn_closure/*.png (holdup/dPdz
                                      f_i_mult/k_wl/k_wg vs. Re_SG scatter
                                      showing the ratio-degeneracy exploit,
                                      model comparison, summary)
+
+-- "Option B" hybrid: NN for f_i_mult only, k_wl/k_wg stay flat scalars,
+   see "Option B hybrid..." above --
+_vuong_fit_nn_fi_only.py          -- 13-weight NN(log Re_SL, log Re_SG) ->
+                                     f_i_mult, bundled with k_wl/k_wg as
+                                     plain scalar leaves (HybridParams
+                                     eqx.Module), all 15 params trained
+                                     jointly through the equilibrium path;
+                                     writes vuong_nn_fi_only_best.eqx
+                                     (not committed)
+_vuong_eval_nn_fi_only_detail.py  -- retrains with full per-epoch loss
+                                     logging, then runs the dynamic-scan
+                                     kh_total check per condition; all
+                                     36/36 stable
+vuong_plots/plot_vuong_nn_fi_only.py -- figures/nn_fi_only/*.png (holdup/
+                                     dPdz parity, convergence, residual,
+                                     f_i_mult vs. Re_SG with the power-law
+                                     curve overlaid, four-way model
+                                     comparison, summary)
 
 -- Weber number regime check, see "Weber number check..." above --
 _vuong_mdpi_weber_check.py       -- computes We for Vuong (fitted
