@@ -361,29 +361,64 @@ def taitel_dukler_residual(ht, U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g,
 
 
 def _bisect_ht(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult, k_wl=1.0,
-                k_wg=1.0, g=9.81, beta=0.0, n_iter=60):
+                k_wg=1.0, g=9.81, beta=0.0, n_iter=60, n_scan=256):
     """
-    Plain bisection for the root of taitel_dukler_residual over ht in
-    (0,1). Not meant to be differentiated through directly -- see
+    Bisection for the root of taitel_dukler_residual over ht in (0,1).
+    Not meant to be differentiated through directly -- see
     solve_taitel_dukler_holdup below, which wraps this with a proper
     implicit-function-theorem gradient instead.
 
     S_Delta(ht) is monotonically decreasing over the physical range in
-    every case checked by the test below (more liquid -> liquid wall
-    friction term grows and dominates) -- not proven in general here, just
-    verified empirically for the stratified-wavy regime this is meant for,
-    and only re-checked at beta=0 so far; the axial gravity term added for
-    nonzero beta is a CONSTANT shift in ht (independent of ht itself), so
-    it can't change where S_Delta(ht) is increasing/decreasing, only shift
-    the whole curve up or down -- monotonicity is preserved by
-    construction, not something nonzero beta could break on its own.
+    EVERY CASE SO FAR VALIDATED AT beta=0 (more liquid -> liquid wall
+    friction term grows and dominates) -- that monotonicity claim was
+    explicitly never re-checked away from horizontal (see this docstring's
+    own prior wording), and it genuinely fails for some real-data corners:
+    at low f_i_mult (weak interfacial friction) combined with uphill beta
+    and very low U_sl, S_Delta(ht) can be S-shaped, with THREE roots
+    instead of one (two real, stable equilibria -- a thin film and a
+    thick film -- separated by one unstable equilibrium in between, the
+    classic saddle-node/fold structure). Confirmed directly on a real Fan
+    (2005) condition during the Fan NN-calibration work: at f_i_mult=0.25
+    the residual crossed zero at alpha_l=0.030, 0.089, 0.113; at
+    f_i_mult=0.235 only the single HIGH root survived -- the low and
+    unstable-middle roots had collided and annihilated. Plain bisection
+    over the full (1e-4, 1-1e-4) bracket has no way to know this: it just
+    tracks whichever root its halving happens to land near, and jumps
+    discontinuously onto a different (physically different!) branch the
+    moment the one it was tracking disappears.
+
+    Fix: a coarse pre-scan (n_scan evenly-spaced points over (1e-4,
+    1-1e-4)) finds the FIRST (lowest-ht) sign change and restricts the
+    n_iter bisection to that narrow bracket, instead of the full range.
+    The lowest-ht root is always the "thin stratified film" branch -- the
+    one consistent with every holdup measurement validated against so far
+    in this project (Fan/MDPI/Vuong are all thin-film stratified-wavy
+    data; nothing here has ever validated against a thick-film branch).
+    When the curve IS monotonic (every case checked before this fix, and
+    the overwhelming majority of real conditions even after it), there is
+    only one crossing in the scan, so this reduces to exactly the old
+    behavior -- the fix only changes anything in the newly-discovered
+    multi-root corner. If the scan finds NO crossing at all (a degenerate
+    case that was already silently unhandled before this fix, since plain
+    bisection would converge to an arbitrary wrong point too), it falls
+    back to the full bracket rather than making that failure mode worse.
     """
-    lo = jnp.asarray(1e-4, dtype=jnp.float64)
-    hi = jnp.asarray(1.0 - 1e-4, dtype=jnp.float64)
+    lo_full = jnp.asarray(1e-4, dtype=jnp.float64)
+    hi_full = jnp.asarray(1.0 - 1e-4, dtype=jnp.float64)
 
     def resid(ht):
         return taitel_dukler_residual(ht, U_sl, U_sg, D, rho_l, rho_g,
                                        mu_l, mu_g, f_i_mult, k_wl, k_wg, g, beta)
+
+    grid = jnp.linspace(lo_full, hi_full, n_scan)
+    r_grid = jax.vmap(resid)(grid)
+    sign_grid = jnp.sign(r_grid)
+    crosses = sign_grid[:-1] != sign_grid[1:]              # (n_scan-1,) bool
+    has_crossing = jnp.any(crosses)
+    first_idx = jnp.argmax(crosses)                        # first True; 0 if none
+
+    lo0 = jnp.where(has_crossing, grid[first_idx], lo_full)
+    hi0 = jnp.where(has_crossing, grid[first_idx + 1], hi_full)
 
     def body(_, carry):
         lo, hi = carry
@@ -395,7 +430,7 @@ def _bisect_ht(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, f_i_mult, k_wl=1.0,
         hi_new = jnp.where(keep_right, hi, mid)
         return (lo_new, hi_new)
 
-    lo, hi = jax.lax.fori_loop(0, n_iter, body, (lo, hi))
+    lo, hi = jax.lax.fori_loop(0, n_iter, body, (lo0, hi0))
     return 0.5 * (lo + hi)
 
 
