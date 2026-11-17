@@ -3205,6 +3205,12 @@ overfit) already demonstrates in miniature.
   (currently blocked by the same missing-surface-tension/KH-instability
   issue) actually be used, instead of being stuck at 36 horizontal-only
   points.
+  **Update (2026-11-16): surface tension was implemented and tested
+  directly against this exact blocker -- it does NOT unlock this data.**
+  See "Surface tension implemented as a KH regularizer -- direct test
+  shows it's the wrong class of fix" below for the full investigation and
+  finding; Stage 2 as originally framed (re-sweep once ST is "in place")
+  is on hold until a genuinely different fix is identified.
 - **Stage 3 (refit on the expanded, inclination-inclusive Vuong
   dataset)**: re-run both the power law and the Option B hybrid on the
   larger set once Stage 2 unlocks it. First point where the NN hybrid
@@ -3232,6 +3238,115 @@ overfit) already demonstrates in miniature.
   choice that has cleanly prevented overfitting every time it's been
   tried in this investigation (Option B vs. the full NN), no reason to
   abandon it just because the dataset grows.
+
+**Surface tension implemented as a KH regularizer -- direct test shows
+it's the wrong class of fix (2026-11-16)**
+- Motivation: Stage 2 of the Forward Roadmap above -- implement surface
+  tension as the regularizing term the module docstring's "KNOWN
+  LIMITATION" section already identified as "expected to be the actual
+  fix" for the Kelvin-Helmholtz-type NaN blowups blocking the 23
+  high-holdup Vuong ST conditions (see that docstring section and
+  Part 2's Step 1 "Forward solver runs cleanly" above for the original
+  characterization: `beta=0` itself NaNs once equilibrium holdup climbs
+  past ~0.5-0.6, inclination only shifts holdup up or down, doesn't
+  independently destabilize anything).
+- **Implementation**: added `sigma*d3(h_l)/dx3` to `Delta`'s governing
+  equation via a joint-implicit `(alpha_l, Delta)` half-step
+  (`_st_joint_residual`/`_implicit_surface_tension_half_step`, new
+  functions in `mixtureTheoryFlow_jax_solver_water_gas.py`), Strang-split
+  around the existing transport step the same way the existing friction
+  half-step already is. Needed to be JOINT (both `alpha_l` and `Delta`
+  as coupled Newton unknowns), not just an implicit update to `Delta`
+  alone, for unconditional stability -- backward-Euler on a 2-variable
+  COUPLED dispersive feedback loop gives amplification factor
+  `|g|=1/sqrt(1+(dt*omega)^2)<=1` for any `dt`; treating only one leg of
+  the loop implicitly reverts to the explicit case's unbounded growth.
+  Caught and fixed a double-counting bug before writing any code:
+  `alpha_l`'s own continuity equation has no existing source/flux split
+  for Strang splitting to exploit (unlike `Delta`'s), so the joint
+  Newton solve computes `alpha_l_new` only to make `Delta_new`
+  self-consistent and DISCARDS it -- only `Delta_new` is written back;
+  `alpha_l`'s real evolution stays 100% owned by the existing
+  `_ssp_rk2_transport` step. Third derivative via the standard centered
+  4-point/5-cell stencil, 2 ghost cells per side (reusing the existing
+  boundary-repetition convention one layer deeper). Added
+  `sigma_star = sigma/(rho_l*Q**2*D)` to `compute_nondim_scales` (derived
+  by dimensional analysis -- unlike most of this solver's formulas, this
+  one does NOT come "for free" under the existing nondimensionalization,
+  same situation as the old solver's viscous-stress/gravity terms).
+  Dense `jax.jacfwd`+`jnp.linalg.solve` Newton was profiled at N=150 and
+  found to cost ~83x the pre-change per-step time -- isolated profiling
+  showed the dense LINEAR SOLVE (1277 us/call), not the Jacobian build
+  (155 us/call), was the dominant cost, overturning the original plan to
+  optimize via a sparse/colored Jacobian build. Replaced with
+  Jacobian-free Newton-Krylov (matrix-free matvec via `jax.jvp`, solved
+  with `jax.scipy.sparse.linalg.gmres`) -- cut the solve cost ~200x and
+  brought total overhead down to ~4x baseline. Validated throughout: a
+  no-op regression (`sigma=0` against the pre-change solver loaded via
+  `git show HEAD:...`, `_st_noop_regression_check.py`) stayed
+  bit-identical both before and after the JFNK swap; a `sigma=0.024`
+  smoke test (`_st_sigma_on_sanity_check.py`) ran clean with no NaN/solve
+  errors on an ordinary condition.
+- **The payoff check, run against the actual 23 high-holdup Vuong ST
+  conditions this was built for**
+  (`_vuong_st_surfacetension_check.py`, full un-reduced CFL `dt`,
+  `n_transit_times=150`): **real-magnitude sigma (0.024 N/m, the actual
+  Isopar L-nitrogen value) rescued 0 of the 17 previously-NaN
+  conditions** -- the exact same NaN pattern as `sigma=0`, no exceptions.
+  The 6 already-robust conditions stayed stable at both.
+- **Follow-up magnitude scan** (`_vuong_st_sigma_magnitude_scan.py`, one
+  representative fast-NaN condition, idx=797, `sigma` swept 0.024 to
+  24000, i.e. up to ~1,000,000x real): NaN through `sigma=240`
+  (10,000x real); at `sigma=2400` (100,000x real) the run goes stable but
+  settles at `alpha_l_pred=0.0237` against a true equilibrium of
+  `0.4731` -- badly wrong, not a real fix, just near-total suppression
+  of interfacial variation; NaN again at `sigma=24000`. Non-monotonic,
+  and not a clean "just needs more sigma" story.
+- **Decisive diagnostic** (`_kh_vs_nan_timing_check.py`): stepped idx=797
+  forward in 20-step chunks at `sigma=0`, checking at each chunk boundary
+  whether `local_wave_speeds`' `is_complex` flag (`disc=trace^2/4-det<0`
+  in the flux Jacobian -- computed from the LOCAL per-cell state and the
+  fixed problem parameters only, no spatial derivative, no wavenumber at
+  all) was active, against whether the state had gone NaN yet. Result:
+  `is_complex` turns on by step 160 and STAYS on continuously through
+  step 3000 (where the run was stopped, still no NaN) -- 10 to 28 of the
+  150 cells have genuinely complex eigenvalues at every single
+  checkpoint, with `alpha_max` climbing steadily (0.68->0.93) and the
+  complex-cell count trending up over the same window. Local
+  hyperbolicity loss isn't a brief excursion right before blowup -- it's
+  the system's persistent operating condition for the entire observed
+  run.
+- **Conclusion**: this directly explains the null/non-monotonic result
+  above, and reframes the whole investigation. `is_complex` is a
+  `k->0` (local, wavenumber-independent) condition; surface tension's
+  regularization is a dispersive `sigma*k^3` term that VANISHES as
+  `k->0` by construction. It has no mathematical leverage over an
+  instability that is already active at the local level -- cranking
+  `sigma` up just buys brute-force suppression of all variation (hence
+  the wrong-equilibrium result at `sigma=2400`), not a genuine fix, and
+  at even higher `sigma` a presumably-separate numerical-stiffness issue
+  (Newton/GMRES convergence at extreme stiffness, not yet isolated)
+  takes back over and NaNs again. **Surface tension is the wrong CLASS
+  of fix for this mechanism, not merely under-scaled or under-resolved**
+  -- this directly contradicts the module docstring's prior "KNOWN
+  LIMITATION" framing ("expected to be the actual fix, not a
+  refinement"), which has been corrected to reflect this finding.
+- **Decision**: do not pursue further sigma-magnitude tuning or grid
+  refinement for this specific instability -- both would just be
+  chasing the same brute-force-suppression mechanism already observed,
+  not a real fix. The dt-reduction workaround remains the practical path
+  for calibrating the high-holdup Vuong ST rows for now. A genuine fix
+  would need to address why `disc` goes negative in the first place --
+  i.e. the stratified closure / flux formulation itself (the interfacial
+  friction term, or a structurally different treatment of the two-fluid
+  momentum exchange) -- not a reactive source term added after the fact.
+  Not yet investigated; this is the open question the project is left
+  with. The new surface-tension implementation itself
+  (`_implicit_surface_tension_half_step` etc.) is left in place, wired
+  through via `sigma=0.0` default (a verified no-op) -- it's correct
+  machinery for a dispersive regularizer, just not the fix for THIS
+  mechanism; it may still be useful once a real high-holdup fix is found
+  and short-wavelength noise needs damping on top of it.
 
 ### Code Structure
 

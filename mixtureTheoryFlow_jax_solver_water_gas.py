@@ -100,22 +100,33 @@ once zero-inclination, low-holdup real-data calibration is working:
   U_sg=5 m/s, not swept across U_sg.
 
   Deferred, to do when circling back (roughly in this order):
-    1. Implement surface tension (or an equivalent short-wavelength KH
-       regularizer) -- expected to be the actual fix, not a refinement;
-       see the physical-mechanism discussion this finding came from
-       (Bernoulli-suction destabilizing term vs. gravity-restoring
-       stabilizing term in the flux Jacobian's disc = trace^2/4 - det).
-    2. Re-run the same U_sl x beta sweep (and extend it across U_sg, not
-       just U_sg=5) with surface tension in place; confirm it actually
-       raises the stability boundary for BOTH uphill inclination and
-       high-holdup horizontal flow, since both trace to the same root
-       cause and a real fix should move both.
-    3. Re-verify the existing beta-plumbing/gradient work still behaves
-       correctly once surface tension is added (it was verified correct
-       in isolation, under the old, more restrictive stability regime --
-       worth re-confirming, not re-deriving).
-    4. Only then extend real-data calibration beyond the current
-       low-holdup, beta=0 scope.
+    1. SUPERSEDED (2026-11-16): surface tension WAS implemented (joint-
+       implicit (alpha_l, Delta) treatment of sigma*d3(h_l)/dx3 in
+       Delta's equation, via Jacobian-free Newton-Krylov -- see
+       _implicit_surface_tension_half_step/_st_joint_residual below) and
+       tested directly against the 23 high-holdup Vuong ST conditions
+       that originally motivated this item. It does NOT turn out to be
+       the fix: real-magnitude sigma rescues 0/17 previously-NaN
+       conditions; a magnitude scan shows it takes ~1e5x the real value
+       before anything even changes, and even there the result is
+       physically wrong (badly over-suppressed, not a real equilibrium).
+       A direct diagnostic (comparing when is_complex first turns on
+       against when the state actually goes NaN) showed why: local loss
+       of hyperbolicity (disc<0 in the flux Jacobian -- a purely local,
+       k-independent condition, no spatial derivative involved) is
+       already present continuously from early in the run, long before
+       any NaN. A dispersive sigma*k^3 term vanishes as k->0, so it has
+       no mathematical leverage over a k=0/local instability -- surface
+       tension is the WRONG CLASS of fix for this specific mechanism,
+       not merely under-scaled or under-resolved. See CLAUDE.md ("Surface
+       tension implemented..." under Part 2) for the full investigation.
+    2-4. Blocked on finding an actual fix for the root hyperbolicity-loss
+       mechanism -- likely requires revisiting the stratified closure or
+       flux formulation itself (what makes disc go negative in the first
+       place), not a reactive source term added after the fact. Not yet
+       pursued; items 2-4's original plan (re-sweep with ST in place,
+       re-verify beta gradients, extend calibration) is on hold until a
+       real candidate fix exists.
 
   Until then: real-data calibration is restricted to the already-
   validated low-holdup regime (matching Fan/MDPI) at beta=0. This is not
@@ -989,6 +1000,145 @@ def _implicit_friction_half_step(alpha_l_int, Delta_int, Q, D, rho_l, rho_g,
     return Delta_int + dt_half * S0 / (1.0 - dt_half * dS)
 
 
+def _st_joint_residual(x, alpha_l_bc, Delta_bc, alpha_l_int_old, Delta_int_old,
+                        dt_half, dx, Q, D, rho_l, rho_g, sigma):
+    """
+    Residual for the joint-implicit (alpha_l, Delta) surface-tension
+    half-step below. `x` packs the INTERIOR unknowns as
+    concat(alpha_l_int_new, Delta_int_new) -- alpha_l_new is solved for
+    ONLY to make Delta_new self-consistent with how alpha_l would respond
+    to it; see _implicit_surface_tension_half_step's docstring for why
+    alpha_l_new is then discarded rather than written back to the state.
+
+    Two residual pieces, each using a deliberately SIMPLER discretization
+    than the production transport step (plain central differencing, not
+    minmod/central-upwind) -- Newton's method needs a smooth residual,
+    and this half-step's only job is to stabilize the dispersive
+    coupling, not to be the accurate transport scheme:
+
+      R_alpha: backward-Euler on alpha_l's OWN flux divergence
+               (flux_alpha = alpha_l*u_l, face value = simple average).
+      R_Delta: backward-Euler on the surface-tension source alone,
+               sigma*d3(h_l)/dx3(alpha_l), via the standard centered
+               4-point (2nd-order) third-derivative stencil -- equivalent
+               to applying the ordinary centered 2nd-derivative operator
+               then the ordinary centered 1st-derivative operator in
+               sequence (checked by hand; same formula either way).
+
+    Ghost cells for the wider (3rd-derivative) stencil reuse the existing
+    boundary convention one layer further out: the boundary value is
+    just repeated again, carrying no new gradient information, the same
+    spirit as the existing 1-ghost-cell stencils elsewhere in this file
+    (reconstruct_faces's boundary treatment, _implicit_friction_half_step
+    leaving index 0/N-1 untouched).
+    """
+    M = alpha_l_int_old.shape[0]
+    alpha_l_int_new = x[:M]
+    Delta_int_new = x[M:]
+
+    alpha_l_full = jnp.concatenate([alpha_l_bc[0:1], alpha_l_int_new, alpha_l_bc[1:2]])
+    Delta_full = jnp.concatenate([Delta_bc[0:1], Delta_int_new, Delta_bc[1:2]])
+
+    # --- R_alpha: simple central-difference flux divergence ---
+    u_l, _ = recover_velocities(alpha_l_full, Delta_full, Q, rho_l, rho_g)
+    flux_alpha = alpha_l_full * u_l
+    flux_face = 0.5 * (flux_alpha[:-1] + flux_alpha[1:])
+    div_alpha = (flux_face[1:] - flux_face[:-1]) / dx
+    R_alpha = (alpha_l_int_new - alpha_l_int_old) / dt_half + div_alpha
+
+    # --- R_Delta: surface-tension dispersive source only ---
+    alpha_l_padded = jnp.concatenate([alpha_l_full[0:1], alpha_l_full, alpha_l_full[-1:]])
+    h_l_padded = h_l_of_alpha(alpha_l_padded, D)
+    d3h_dx3 = (-h_l_padded[:-4] + 2.0 * h_l_padded[1:-3]
+               - 2.0 * h_l_padded[3:-1] + h_l_padded[4:]) / (2.0 * dx**3)
+    R_Delta = (Delta_int_new - Delta_int_old) / dt_half + sigma * d3h_dx3
+
+    return jnp.concatenate([R_alpha, R_Delta])
+
+
+def _implicit_surface_tension_half_step(alpha_l, Delta, dt_half, dx, Q, D, rho_l, rho_g,
+                                         sigma=0.0, n_newton=3):
+    """
+    Joint-implicit (alpha_l, Delta) half-step for the new surface-tension
+    source term sigma*d3(h_l)/dx3 in Delta's equation (see CLAUDE.md,
+    "incorporating surface tension with the implicit treatment", for the
+    full physical derivation and the numerical-stability argument this
+    implements).
+
+    WHY JOINT, UNLIKE _implicit_friction_half_step: freezing alpha_l (the
+    Reynolds-stress pattern -- Delta implicit, alpha_l frozen) makes this
+    new term's effect on Delta a plain precomputed number, since the term
+    depends only on alpha_l, not Delta -- nothing left to solve, and the
+    genuine alpha_l<->Delta feedback loop (through recover_velocities and
+    alpha_l's own flux) stays entirely unprotected, forcing dt ~ dx^3 for
+    stability. Solving (alpha_l, Delta) jointly, implicitly, both at the
+    new time level, is what gives the coupled system's amplification
+    factor the unconditionally-bounded 1/sqrt(1+(dt*omega)^2) form instead
+    (omega set by the loop's own dispersive stiffness) -- bounded for ANY
+    dt, not just dt below some threshold.
+
+    WHY alpha_l_new IS DISCARDED, NOT WRITTEN BACK: alpha_l's equation
+    (unlike Delta's) has no existing source/flux split -- ALL of its
+    evolution is the flux divergence _ssp_rk2_transport already handles,
+    accurately, once per full timestep. Giving alpha_l a second,
+    independent dt_half advection budget here (via the simplified
+    central-difference flux above, not the real minmod/central-upwind
+    scheme) would double-count its transport. Solving for it anyway (as
+    an auxiliary unknown) is still necessary -- it's what keeps Delta's
+    own equation from being the vacuous frozen-alpha_l case above -- it
+    just never gets persisted into the real state. alpha_l's real update
+    continues to come 100% from the untouched _ssp_rk2_transport step.
+
+    At sigma=0.0, R_Delta has no sigma-dependence left at all, so
+    Delta_int_new = Delta_int_old exactly regardless of n_newton or what
+    the auxiliary alpha_l solve converges to -- this half-step is an
+    unconditional no-op when surface tension is off, same spirit as
+    beta=0 being a no-op for the inclination plumbing.
+
+    Jacobian-FREE Newton-Krylov (JFNK): each Newton step's linear solve
+    is done via GMRES against a matrix-vector product computed directly
+    by jax.jvp(residual, (x,), (v,)) -- the Jacobian is NEVER built as an
+    explicit matrix. This was chosen over BOTH alternatives considered
+    earlier (a dense jax.jacfwd + jnp.linalg.solve, or a hand-derived
+    banded elimination) based on direct profiling at production grid
+    size (N=150, 2*(N-2)=296 unknowns): the dense LINEAR SOLVE, not the
+    Jacobian build, turned out to be the dominant cost (1277 us vs. 155
+    us) -- so a sparsity-exploiting Jacobian build alone (the originally
+    planned follow-up) would have barely helped, while JFNK's
+    matrix-free matvec + GMRES solve fixes the real bottleneck directly
+    (6.4 us, a ~200x reduction on that piece, verified to match the
+    dense solve's answer exactly) with NO matrix of any kind, dense or
+    banded, ever constructed. It also generalizes to a future 3-phase
+    extension even more cleanly than either original option: it needs no
+    sparsity-pattern/bandwidth knowledge at all, just matrix-vector
+    products, which jax.jvp provides identically regardless of how many
+    fields are coupled.
+    """
+    alpha_l_bc = jnp.array([alpha_l[0], alpha_l[-1]])
+    Delta_bc = jnp.array([Delta[0], Delta[-1]])
+    alpha_l_int_old = alpha_l[1:-1]
+    Delta_int_old = Delta[1:-1]
+    M = alpha_l_int_old.shape[0]
+
+    def residual(x):
+        return _st_joint_residual(x, alpha_l_bc, Delta_bc, alpha_l_int_old, Delta_int_old,
+                                   dt_half, dx, Q, D, rho_l, rho_g, sigma)
+
+    x = jnp.concatenate([alpha_l_int_old, Delta_int_old])
+    for _ in range(n_newton):
+        R = residual(x)
+
+        def matvec(v):
+            return jax.jvp(residual, (x,), (v,))[1]
+
+        step, _ = jax.scipy.sparse.linalg.gmres(
+            matvec, -R, tol=1e-10, atol=1e-12, restart=20, maxiter=10
+        )
+        x = x + step
+
+    return x[M:]
+
+
 def _transport_only_step(state, dt, dx, Q, D, rho_l, rho_g,
                           alpha_l_inlet, Delta_inlet, g=9.81, theta=1.3,
                           beta=0.0):
@@ -1079,24 +1229,39 @@ def _ssp_rk2_transport(state, dt, dx, Q, D, rho_l, rho_g,
 
 def advance_state(state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
                    alpha_l_inlet, Delta_inlet, g=9.81, f_i_mult=1.0,
-                   k_wl=1.0, k_wg=1.0, theta=1.3, beta=0.0):
+                   k_wl=1.0, k_wg=1.0, theta=1.3, beta=0.0, sigma=0.0,
+                   n_newton_st=3):
     """
     Full Strang-split timestep: implicit friction half-step (dt/2) ->
-    explicit SSP-RK2 transport full-step (dt) -> implicit friction
-    half-step (dt/2). alpha_l is untouched by the friction half-steps
-    (only Delta evolves there); boundary cells (index 0, N-1) are left to
-    the fixed inlet/zero-gradient treatment throughout -- friction is
-    only ever evaluated on genuine interior cells.
+    joint-implicit surface-tension half-step (dt/2) -> explicit SSP-RK2
+    transport full-step (dt) -> joint-implicit surface-tension half-step
+    (dt/2) -> implicit friction half-step (dt/2). alpha_l is untouched by
+    BOTH kinds of implicit half-step (only Delta is ever written back
+    from either -- see _implicit_surface_tension_half_step's docstring
+    for why its own internal alpha_l solve is discarded); boundary cells
+    (index 0, N-1) are left to the fixed inlet/zero-gradient treatment
+    throughout -- friction and surface tension are only ever evaluated on
+    genuine interior cells.
+
+    sigma=0.0 (default) makes the new surface-tension half-steps an
+    unconditional no-op -- see that function's docstring -- so this is
+    backward compatible with every existing call site/result.
     """
     alpha_l = state['alpha_l']
     Delta   = state['Delta']
 
-    # Part 1: implicit friction half-step
-    Delta_int_1 = _implicit_friction_half_step(
+    # Part 1a: implicit friction half-step
+    Delta_int_1a = _implicit_friction_half_step(
         alpha_l[1:-1], Delta[1:-1], Q, D, rho_l, rho_g, mu_l, mu_g, dt / 2.0,
         f_i_mult, k_wl, k_wg, g, beta
     )
-    Delta_1 = jnp.concatenate([Delta[0:1], Delta_int_1, Delta_int_1[-1:]])
+    Delta_1a = jnp.concatenate([Delta[0:1], Delta_int_1a, Delta_int_1a[-1:]])
+
+    # Part 1b: joint-implicit surface-tension half-step
+    Delta_int_1b = _implicit_surface_tension_half_step(
+        alpha_l, Delta_1a, dt / 2.0, dx, Q, D, rho_l, rho_g, sigma, n_newton_st
+    )
+    Delta_1 = jnp.concatenate([Delta_1a[0:1], Delta_int_1b, Delta_int_1b[-1:]])
     state_1 = {'alpha_l': alpha_l, 'Delta': Delta_1}
 
     # Part 2: explicit SSP-RK2 transport
@@ -1104,20 +1269,26 @@ def advance_state(state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
         state_1, dt, dx, Q, D, rho_l, rho_g, alpha_l_inlet, Delta_inlet, g, theta, beta
     )
 
-    # Part 3: second implicit friction half-step
+    # Part 3a: joint-implicit surface-tension half-step, mirrored
     alpha_l_2, Delta_2 = state_2['alpha_l'], state_2['Delta']
-    Delta_int_3 = _implicit_friction_half_step(
-        alpha_l_2[1:-1], Delta_2[1:-1], Q, D, rho_l, rho_g, mu_l, mu_g, dt / 2.0,
+    Delta_int_3a = _implicit_surface_tension_half_step(
+        alpha_l_2, Delta_2, dt / 2.0, dx, Q, D, rho_l, rho_g, sigma, n_newton_st
+    )
+    Delta_3a = jnp.concatenate([Delta_2[0:1], Delta_int_3a, Delta_int_3a[-1:]])
+
+    # Part 3b: second implicit friction half-step
+    Delta_int_3b = _implicit_friction_half_step(
+        alpha_l_2[1:-1], Delta_3a[1:-1], Q, D, rho_l, rho_g, mu_l, mu_g, dt / 2.0,
         f_i_mult, k_wl, k_wg, g, beta
     )
-    Delta_final = jnp.concatenate([Delta_2[0:1], Delta_int_3, Delta_int_3[-1:]])
+    Delta_final = jnp.concatenate([Delta_3a[0:1], Delta_int_3b, Delta_int_3b[-1:]])
 
     return {'alpha_l': alpha_l_2, 'Delta': Delta_final}, n_kh
 
 
 def run_to_steady(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N,
                    dt, n_steps, g=9.81, f_i_mult=1.0, k_wl=1.0, k_wg=1.0,
-                   theta=1.3, beta=0.0):
+                   theta=1.3, beta=0.0, sigma=0.0, n_newton_st=3):
     """
     Run the full solver (advance_state) from the no-slip initial condition
     for n_steps of size dt, via jax.lax.scan. Returns the final state and
@@ -1134,7 +1305,8 @@ def run_to_steady(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N,
         state, kh_total = carry
         new_state, n_kh_faces = advance_state(
             state, dt, dx, Q, D, rho_l, rho_g, mu_l, mu_g,
-            alpha_l_inlet, Delta_inlet, g, f_i_mult, k_wl, k_wg, theta, beta
+            alpha_l_inlet, Delta_inlet, g, f_i_mult, k_wl, k_wg, theta, beta,
+            sigma, n_newton_st
         )
         return (new_state, kh_total + n_kh_faces), None
 
@@ -1213,7 +1385,7 @@ def estimate_stable_dt(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, dx,
     return cfl * dx / speed
 
 
-def compute_nondim_scales(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, g=9.81):
+def compute_nondim_scales(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, g=9.81, sigma=0.0):
     """
     Boundary-conversion layer: turns raw dimensional condition data into
     the reference scales this solver is run in internally, plus two extra
@@ -1270,10 +1442,22 @@ def compute_nondim_scales(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, g=9.81):
     g_star = g * D / Q**2
     Re_SL = rho_l * U_sl * D / mu_l
     Re_SG = rho_g * U_sg * D / mu_g
+
+    # sigma_star: unlike everything else above, sigma*d3(h_l)/dx3 is NOT
+    # already a "free lunch" under this scaling, because it has its own
+    # dimensional constant (sigma) with no companion scale to cancel
+    # against -- same reasoning the oil-water solver's own
+    # nondimensionalization pass used for viscous stress/gravity (see
+    # CLAUDE.md). sigma*d3h/dx3 has units Pa/m (matching every other
+    # S_Delta term); dividing by the pressure-gradient scale P_c/D gives
+    # sigma_star = sigma / (rho_l*Q**2*D).
+    sigma_star = sigma / (rho_l * Q**2 * D)
+
     return {
         'Q': Q, 'D_star': 1.0, 'rho_l_star': 1.0, 'rho_g_star': rho_g_star,
         'mu_l_star': mu_l_star, 'mu_g_star': mu_g_star, 'g_star': g_star,
-        'P_c': rho_l * Q**2, 't_c': D / Q, 'Re_SL': Re_SL, 'Re_SG': Re_SG,
+        'sigma_star': sigma_star, 'P_c': rho_l * Q**2, 't_c': D / Q,
+        'Re_SL': Re_SL, 'Re_SG': Re_SG,
     }
 
 
@@ -1321,7 +1505,8 @@ def predicted_pressure_gradient(alpha_l, Delta, Q, D, rho_l, rho_g, mu_l, mu_g,
 
 def run_real_data_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
                              n_transit_times=100.0, cfl=0.25, g=9.81, f_i_mult=1.0,
-                             k_wl=1.0, k_wg=1.0, theta=1.3, outlet_window=10, beta=0.0):
+                             k_wl=1.0, k_wg=1.0, theta=1.3, outlet_window=10, beta=0.0,
+                             sigma=0.0, n_newton_st=3):
     """
     Run one real-data condition to (approximate) steady state and return
     the diagnostics needed to validate against it: predicted outlet
@@ -1375,11 +1560,12 @@ def run_real_data_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
     changes to any of the physics functions it calls.
     """
     Q = U_sl + U_sg
-    nd = compute_nondim_scales(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, g)
+    nd = compute_nondim_scales(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, g, sigma)
     U_sl_star, U_sg_star = U_sl / Q, U_sg / Q
     rho_l_star, rho_g_star = nd['rho_l_star'], nd['rho_g_star']
     mu_l_star, mu_g_star = nd['mu_l_star'], nd['mu_g_star']
     g_star, D_star = nd['g_star'], nd['D_star']
+    sigma_star = nd['sigma_star']
     L_star = L / D
     dx_star = L_star / N
 
@@ -1398,7 +1584,7 @@ def run_real_data_condition(U_sl, U_sg, D, rho_l, rho_g, mu_l, mu_g, L, N=150,
         new_state, n_kh_faces = advance_state(
             state, dt_star, dx_star, 1.0, D_star, rho_l_star, rho_g_star,
             mu_l_star, mu_g_star, alpha_l_inlet, Delta_inlet_star, g_star,
-            f_i_mult, k_wl, k_wg, theta, beta
+            f_i_mult, k_wl, k_wg, theta, beta, sigma_star, n_newton_st
         )
         a_min = jnp.minimum(a_min, jnp.min(new_state['alpha_l']))
         a_max = jnp.maximum(a_max, jnp.max(new_state['alpha_l']))
