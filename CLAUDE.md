@@ -3348,6 +3348,109 @@ it's the wrong class of fix (2026-11-16)**
   mechanism; it may still be useful once a real high-holdup fix is found
   and short-wavelength noise needs damping on top of it.
 
+**Disc-negative mechanism identified (Bernoulli-suction vs. gravity);
+boosting `f_i_mult` avoids the NaN but does NOT give correct holdup
+(2026-11-18)**
+- Motivation: the open question left by the surface-tension entry above
+  -- what in the closure actually drives `disc` negative in the first
+  place.
+- **Analytical mechanism, verified against `jax.jacfwd`**
+  (`_disc_mechanism_check.py`): hand-differentiated `recover_velocities`'
+  defining linear system and pushed the result through `physical_flux`.
+  With `denom = rho_l*alpha_g + rho_g*alpha_l` and slip `du = u_g - u_l`:
+  `dF_alpha/dalpha = u_l + alpha*rho_g*du/denom`,
+  `dF_alpha/dDelta = alpha*alpha_g/denom`,
+  `dF_Delta/dDelta = (rho_l*alpha_g*u_l + rho_g*alpha*u_g)/denom`, and
+  the interesting one,
+  `dF_Delta/dalpha = -rho_l*rho_g*du**2/denom + (rho_l-rho_g)*g*cos(beta)*(A/S_i)`
+  -- a negative "Bernoulli" term that grows with the SQUARE of the slip
+  velocity, competing against a positive "gravity/buoyancy" term that
+  depends only on density difference and local geometry (`A/S_i`,
+  `dh_l/dalpha` from `h_l_of_alpha`'s own docstring), NOT on slip at all.
+  Verified bit-for-bit against `jax.jacfwd` at 10 random states (max rel
+  err ~3.6e-11). Physically, this is the classical two-layer
+  shallow-water Kelvin-Helmholtz criterion: a local interface bulge
+  narrows the gas channel there, the gas speeds up (Venturi/continuity),
+  its pressure drops there (Bernoulli), and that pressure drop sucks the
+  interface up further instead of pushing back -- self-reinforcing,
+  scaling as `du^2` because both the Venturi speed-up and Bernoulli's
+  pressure-velocity tradeoff are themselves quadratic in velocity.
+  Confirmed numerically on idx=797 (the fast-NaN Vuong ST condition, step
+  400): every `is_complex`-flagged cell shows the Bernoulli term beating
+  the gravity term by 3-5x, with the clearest case (cell 13) showing a
+  nearly-stagnant liquid layer (`u_l~0.011`) under fast gas
+  (`u_g~1.74`) -- the textbook KH setup.
+- **Structural finding: interfacial friction (`tau_i`) cannot touch
+  `disc` at all.** Read `_wall_and_interfacial_shear`/
+  `stratified_momentum_source`/`_implicit_friction_half_step` directly:
+  `tau_i` only ever enters through `dynamic_source_Delta`, consumed by
+  the Strang-split friction half-step, which solves for `Delta` alone
+  with `alpha_l` FROZEN -- entirely separate from `physical_flux`, the
+  only thing `local_wave_speeds`/`is_complex` differentiates. So
+  `f_i_mult`/`k_wl`/`k_wg` cannot change whether `disc` goes negative at
+  a given `(alpha_l, Delta)` snapshot, at any magnitude -- this is
+  architectural, not a question of strength. What friction CAN do is
+  change what holdup the system is trying to reach in the first place:
+  stronger interfacial friction (physically, the fast gas dragging the
+  liquid forward harder) lets the liquid carry the same fixed `U_sl`
+  at a higher velocity through a correspondingly thinner layer, pulling
+  the equilibrium holdup down. If that pulls the target below the
+  already-characterized ~0.4-0.5 instability threshold (see the module
+  docstring's "KNOWN LIMITATION" section), the trajectory never needs to
+  visit the unstable region to get there.
+- **Empirical test 1 (stability, `_fi_mult_magnitude_scan.py` /
+  `_fi_mult_threshold_and_calibration_check.py`)**: confirmed the
+  mechanism above directly. Fine `f_i_mult` scan on idx=797 (`k_wl=k_wg=1`)
+  shows equilibrium holdup dropping monotonically with `f_i_mult`
+  (0.47 at 1.0 down to 0.02 at 10000) and a NaN/stable threshold between
+  `f_i_mult=2.0` (NaN) and `~3.5` (clean). The project's ALREADY-ADOPTED
+  Vuong production calibration (`f_i_mult=3.8893, k_wl=1.5419,
+  k_wg=0.8413` -- fit entirely on the 36 low/moderate-holdup Vuong SW
+  conditions, for unrelated reasons, never tested against this ST
+  subset) sits inside that window and, applied with zero refitting to
+  all 23 high-holdup Vuong ST conditions, rescues 16 of the 17
+  previously-NaN conditions, converging cleanly to self-consistency
+  (matches its own steady Taitel-Dukler equilibrium) in 15 of those 16.
+  Two stragglers: idx=820 (still NaN; its own target equilibrium, 0.28,
+  sits closer to the danger threshold than the others) and idx=832
+  (stable but does not converge to its own equilibrium, diff=0.143 --
+  not yet investigated, possibly just needs a longer `n_transit_times`).
+- **CRITICAL CORRECTION -- the above is a self-consistency check, not an
+  accuracy check, and conflating the two was a real mistake made and
+  caught in this same investigation.** "Converges to its own equilibrium"
+  only confirms the transient solver correctly relaxes to whatever ITS
+  OWN closure's steady-state equation says the answer should be -- it
+  says nothing about whether that answer matches reality. Checked
+  properly against the FFPU dataset's actual measured `HL[-]` column
+  (`_fi_mult_vs_measured_holdup_check.py`), across the 20 ST conditions
+  with a valid measured value (2 rows have no measured `HL`, 1 is the
+  still-NaN idx=820): the production calibration **over-predicts holdup
+  in every single case**, from +3.3% (the lowest-flow condition) up to
+  +149.3% (the highest-flow conditions), **mean |err%|=79.9%, mean signed
+  bias=+79.9%** -- a large, one-directional, systematic error, not
+  scattered noise, and growing with flow rate/holdup rather than uniform
+  across the set.
+- **Conclusion**: the friction-moves-the-equilibrium mechanism is real
+  and correctly understood -- stronger interfacial friction genuinely
+  does pull the trajectory out of the Bernoulli-dominated unstable
+  region. But the SPECIFIC production-calibrated values (fit on a
+  different dataset/regime, the 36-condition SW set) overshoot well past
+  the real answer on the way down: numerically stable, but systematically
+  wrong, in exactly the same "large, same-signed bias" pattern this
+  project has flagged before as a real cross-condition generalization
+  gap (not a bug) -- see the Russell/Angeli out-of-sample checks under
+  Part 1. Numerical stability and physical accuracy are separate
+  questions; passing the first does not imply passing the second, and
+  this investigation is the direct cautionary example for that.
+- **Decision / not yet done**: do not treat the SW-fit production
+  calibration as usable for the ST dataset as-is. Using this mechanism
+  productively would need a DEDICATED fit against the 23 (or the fuller
+  28-condition inclined) Vuong ST conditions specifically, not a
+  borrowed SW-fit closure -- not yet attempted. Also still open: why
+  idx=820 remains NaN even under the production calibration, and why
+  idx=832 doesn't converge to its own equilibrium within
+  `n_transit_times=150` -- neither investigated further yet.
+
 ### Code Structure
 
 ```
