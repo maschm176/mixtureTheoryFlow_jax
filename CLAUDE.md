@@ -42,7 +42,9 @@ of two-phase pipe flow in Python/JAX, validated against experimental data:
   positivity-preserving) better suited to gas-liquid flow's much lower
   liquid holdups, which broke Part 1's formulation (see Part 1's Known
   Issues, "Vanishing-Phase Singularity Dominates..."). Calibrated against
-  Vuong (2016) oil-nitrogen data so far — see Part 2's own References for
+  Vuong (2016) oil-nitrogen data so far (horizontal stratified-wavy and
+  +2 deg inclined rows; one NN for `f_i_mult` with flat `k_wl`/`k_wg` now
+  spans both -- see Part 2) — see Part 2's own References for
   Fan (2005) and Carraretto et al. (2020)/MDPI, the other two gas-liquid
   datasets in use.
 
@@ -518,7 +520,9 @@ expected:
   Singularity Dominates (Not Just Bounds) Gas-Liquid Data" under Known
   Issues for the full writeup, including a second, compounding
   density-ratio conditioning issue specific to gas-liquid.
-- **Not yet resolved — open decision, not yet made**: (a) try lowering
+- **Not yet resolved — open decision, not yet made** (**2026-11-23: effectively
+  superseded by Part 2** -- the gas-liquid work moved to the reduced-model
+  solver, and Fan's inclined rows were taken up there; see Part 2): (a) try lowering
   `PHI_COLLAPSE` now that these datasets provide a maximally-stressed test
   case (risk: it was never validated at a much smaller value, and the
   "safe substitution" `jnp.where` pattern it relies on was only exercised
@@ -2412,6 +2416,16 @@ original sequence this is modeled on):
    `a911ca9`). Until surface tension is added, real-data work stays
    scoped to `beta=0`, low-holdup — a deliberate boundary, not a bug to
    route around.
+   **Superseded (2026-11-14 to 2026-11-23)**: surface tension was built and
+   shown to be the wrong class of fix, so that checklist no longer
+   applies, and the `beta=0` boundary has been lifted for the validated
+   rows anyway: Fan's 47 inclined rows run fine at ~150 transit times
+   (their holdup is low), and Vuong's +2 deg ST rows are usable through
+   calibration -- flat ST and pooled SW+ST fits with `beta` threaded
+   through, 0/23 NaN and `kh_total=0` in the dynamic solver. The
+   instability itself is NOT fixed (default-closure runs still go
+   unstable); see "Inclined-flow investigation, as it stands now..." near
+   the end of this Part.
 
    One direct consequence for the sister notebook: `run_real_data_
    condition` runs each condition to its own steady state internally and
@@ -2612,6 +2626,13 @@ docstring's "KNOWN LIMITATION" section for the full reasoning): surface
 tension / KH regularization, re-sweeping across inclination and `U_sg`,
 re-verifying gradients once that's added, and only then lifting the Fan
 (2005) horizontal-only filter to include its other 47 (inclined) rows.
+**Superseded in part (2026-11-14 to 2026-11-23)**: the Fan inclined rows
+WERE lifted into use without surface tension -- and the binary
+`kh_total>0` exclusion above turned out to rest on runs that were too
+short (the "prediction" was just the inlet value); those rows settle onto
+the closed-form equilibrium given enough transit times. Surface tension
+was built and found to be the wrong class of fix. See "Inclined-flow
+investigation, as it stands now..." near the end of this Part.
 
 **Vuong (2016) joint (f_i_mult, k_wl, k_wg) calibration against holdup
 AND dPdz -- final result (2026-11-05)**
@@ -3211,6 +3232,14 @@ overfit) already demonstrates in miniature.
   shows it's the wrong class of fix" below for the full investigation and
   finding; Stage 2 as originally framed (re-sweep once ST is "in place")
   is on hold until a genuinely different fix is identified.
+  **Further update (2026-11-23)**: the ST rows turned out to be usable
+  WITHOUT a flux fix, by calibrating around the instability (a dedicated
+  flat fit and a pooled SW+ST fit, both with `beta` threaded through --
+  the first versions had omitted it). So the Stage 3 refit on
+  inclination-inclusive Vuong data has effectively been done, as one NN
+  for `f_i_mult` plus flat `k_wl`/`k_wg` spanning SW and ST; see "Pooled
+  SW+ST fit with `beta` threaded through..." below. Stage 2 stays open
+  only as a way to remove the dependence on calibration.
 - **Stage 3 (refit on the expanded, inclination-inclusive Vuong
   dataset)**: re-run both the power law and the Option B hybrid on the
   larger set once Stage 2 unlocks it. First point where the NN hybrid
@@ -3450,6 +3479,334 @@ boosting `f_i_mult` avoids the NaN but does NOT give correct holdup
   idx=820 remains NaN even under the production calibration, and why
   idx=832 doesn't converge to its own equilibrium within
   `n_transit_times=150` -- neither investigated further yet.
+- **Superseded (2026-11-23)**: the "DEDICATED fit ... not yet
+  attempted" item just above WAS attempted (see "Pooled SW+ST NN fit..."
+  and the `beta` finding below) -- but the first dedicated ST fit
+  turned out to have been fit WITHOUT inclination, so its numbers were
+  redone. Read the next entries before quoting any ST-dedicated or
+  pooled number from the investigation write-up
+  (`INVESTIGATION_SUMMARY_inclination_RS_surfacetension.md`, Sections
+  13-14, which still carry the uncorrected values and two other stale
+  statements: it calls the `_bisect_ht` fix uncommitted [it is in
+  `fe9d0d8`] and `fan_plots/plot_fan_nn_fi_only.py` unrun [it has been
+  run]).
+
+**Inclined-flow investigation, as it stands now: Reynolds stress fails,
+the `kh_total` exclusion was too strict, a real solver bug was fixed
+(2026-11-13 to 2026-11-23; full per-step detail in
+`INVESTIGATION_SUMMARY_inclination_RS_surfacetension.md`)**
+- **Reynolds stress (RS) does not stabilize the Kelvin-Helmholtz (KH)
+  instability.** Tested explicit and implicit (backward-Euler tridiagonal
+  solve via `thomas_solve`), face-flux and cell-centered, `nu_t` from
+  0.01x to 100,000x the Thorpe default (1.3e-5 m^2/s); none gave real
+  stabilization -- the one apparent improvement at extreme magnitude is
+  the wave being crushed flat. Visualization re-run (2026-11-20, idx=797
+  Vuong ST row, +2 deg, N=1800 -- the only resolution where RS has any
+  effect, ~zero at N<=300 -- default dt, only 2 nominal transits, ~5 min
+  total): NaN at step 7400 with no RS, 8000 at 1x, 8400 at 100x, none at
+  100,000x; complex-eigenvalue cells at each run's last step 75 / 80 /
+  113 / 337 (of 1800); profile variation (alpha_max-alpha_min) at step
+  6000: 0.88 / 0.81 / 0.72 / 0.10. Strong RS only DELAYS the complex
+  cells (zero until ~step 6200, then 337 and still rising). 100,000x is
+  nu_t = 1.3 m^2/s, far above any physical eddy viscosity for a 0.156 m
+  pipe -- a flattening limit, not a candidate setting. My reading (an
+  inference, not separately tested): RS is a diffusive `k^2` term added
+  on top of the flux and never touches the `-rho_l*rho_g*du^2` Jacobian
+  entry that drives `disc<0` (see the Bernoulli entry above).
+- **The `kh_total>0` exclusion rule was built on runs that were too
+  short.** Fan/MDPI runs capped at 10-15 transit times returned
+  `alpha_l_pred` equal to the raw INLET value (`U_sl/Q`) because the
+  instability hadn't reached the outlet window yet. Given enough time
+  (up to ~2000 transits for very low `U_sl`) low-holdup conditions settle
+  onto the closed-form `solve_taitel_dukler_holdup` equilibrium to
+  1e-7..1e-12 while `kh_total` keeps accumulating forever (every face,
+  every step) -- a bounded "statistical" equilibrium, not a failure.
+  **This supersedes the binary `kh_total>0` exclusion policy** described
+  above ("Fan (2005) zero-refit run surfaces a second instability
+  trigger") and applied in `_fan_data.py` (`EXCLUDE_KH_USL`, 11 of 60
+  Fan rows): those 9 inclined rows are usable.
+- **Fan inclined rows, default closure, shown directly (2026-11-20;
+  `_fan_incl_instability_cache.py`, `_fan_incl_row0_trace.py`, N=150,
+  default dt, 34 inclined rows that have measured `HL`)**: at 10
+  transits every prediction equals the inlet value `U_sl/Q` (to 1e-13),
+  mean |error| vs measured holdup 96%; at 150 transits (~45 s per row at
+  ~2100 steps/s; 100,000 transits would be ~8 h per row and is not
+  needed) none go NaN, mean error 45% (predicted/measured 0.45-2.7),
+  and the 9 `kh_total>0` rows land on their closed-form value to 4e-9
+  relative (error 96% -> 42%). One unflagged row (idx 38, `U_sl`=0.0031)
+  is still 0.6% from closed-form at 150 transits. Row 0 (`U_sl`=0.0241,
+  `U_sg`=19.97, -1 deg): outlet holdup sits at the inlet value 0.0012
+  until the front arrives at ~22 transits, then jumps to 0.02898 = the
+  closed-form value (and reproduces `run_real_data_condition`'s 0.02898);
+  complex cells climb with the front to 143/150 and plateau;
+  `kh_total` 381k at 10 transits -> 23.9M at 150. Profile is smooth, no
+  spikes. Note Fan's measured `HL` is reported only as 0.01 or 0.02.
+- **Real inclined data, summary**: Fan 47 inclined rows -> 0 NaN; Vuong's
+  28 "ST" rows (all +2 deg, `L=85 m` assumed) split into 23 genuinely
+  high-holdup (default-closure equilibrium 0.34-0.56) and 5 low-holdup
+  rows that were fine all along (see the multi-root fix just below).
+- **Genuine solver bug found and fixed: `_bisect_ht` assumed one
+  equilibrium root.** At low `f_i_mult` + uphill `beta` + very low `U_sl`
+  the force balance can be S-shaped with THREE roots (a saddle-node/fold
+  bifurcation): e.g. Fan `U_sl=0.00308, U_sg=20.04, +2 deg` has roots
+  0.030/0.089/0.113 at `f_i_mult=0.25` collapsing to one at ~0.234.
+  Plain bisection jumped onto the thick-film branch. Fix (commit
+  `fe9d0d8`): a coarse 256-point pre-scan and always track the LOWEST
+  root (the thin-film branch every measurement is on). Verified bit-
+  identical (~1e-15) on Fan/MDPI/Vuong-horizontal/Vuong's adopted
+  calibration. Effect on the Fan "Option B" NN refit (post-fix,
+  `fan_nn_fi_only_best.eqx`, `k_wl=2.3110, k_wg=1.2617`, 39/10 split):
+  test holdup error 223% (1610% outlier) -> 21.19%, train 8.86%, dP/dz
+  8.97%/8.84%. The Fan figure set was regenerated from that fit (the
+  plot script's hardcoded table, transcribed from a since-lost log, was
+  checked against the checkpoint by `_fan_eval_nn_checkpoint.py`: all 49
+  rows match to printed precision); the older horizontal-only figures
+  were moved to `figures/fan_nn_fi_only/_prev_2026-11-12_horizontal_only/`.
+  Not-yet-addressed observations on that Fan fit: its `f_i_mult` spans
+  0.0016-10 across training rows (one unmeasured row near zero, i.e.
+  essentially no interfacial friction) and is not a smooth function of
+  `Re_SG`, which looks like the network absorbing per-condition error.
+- **Small-dt result (`_vuong_st_dt_*_check.py`)**: `dt <= 0.25x` the CFL
+  estimate removes the NaN for all 23 high-holdup ST rows but they do not
+  reach the correct equilibrium; the flow stays wavy even at 2000
+  transit times. `dt` hides the blow-up, it does not cure the mechanism.
+
+**`beta` was never passed in the ST-dedicated and pooled fits -- the ST
+rows were fit as if horizontal (found 2026-11-23); corrected refit**
+- `_st_fit_joint_equilibrium.py` and `_pooled_sw_st_fit_nn_fi_only.py`
+  call `solve_taitel_dukler_holdup` and `predicted_pressure_gradient`
+  with no `beta`, so `beta` defaulted to 0 and the +2 deg ST rows were
+  treated as horizontal. The Fan fit and `_st_fit_stability_check.py` do
+  thread `beta`. Evidence, from re-evaluating the recorded ST parameters
+  (`f_i_mult=10.6923, k_wl=2.6477, k_wg=0.8510`): the recorded losses
+  (train 0.020856, test 0.066252) reproduce only at `beta=0`; at
+  `beta=+2 deg` they are 0.073373 / 0.088835 (the dP/dz component
+  0.0016 -> 0.042, ~27x). Holdup error over the 21 rows: 12.7% (bias
+  -1.7%) at `beta=0` vs 15.7% (bias +8.9%) at `beta=+2 deg` -- the latter
+  is the number Section 13 of the investigation file reported from the
+  dynamic solver, i.e. the old parameters were evaluated under physics
+  they were not fit to.
+- **Scope of the bug: the fitting scripts only.** The dynamic solver, the
+  flux Jacobian (its gravity term carries `cos(beta)`) and every
+  default-closure run always had `beta` -- so the KH-instability evidence
+  is unaffected by this bug.
+- **Corrected ST-dedicated refit** (`_st_fit_joint_equilibrium_beta.py`,
+  new file, original untouched; `st_fit_beta_result.pkl`): same 21 rows
+  (15 train / 6 test), same loss, Adam lr 0.06, 3000 epochs, `beta` now
+  threaded through. Both warm starts (SW production values, old ST
+  values) converge to the SAME optimum: **`f_i_mult=9.2809,
+  k_wl=1.6477, k_wg=0.7736`**, train loss 0.023027 (holdup 0.019086,
+  dP/dz 0.003941), test 0.062817 (0.047969 / 0.014848); over all 21
+  rows at +2 deg: holdup 13.1% mean error (bias -3.1%), dP/dz 6.0%
+  (bias -2.0%). Equilibrium is hyperbolic (0 complex) in 23/23 rows.
+- **What changed and what did not**: the wall multipliers now agree with
+  the SW fit (`k_wl` 1.65 vs 1.54, `k_wg` 0.77 vs 0.84; the old ST fit's
+  `k_wl` was 72% higher), i.e. the missing `beta` had been absorbed by
+  `k_wl`/`k_wg`. `f_i_mult` did NOT converge toward the SW value: 9.28 vs
+  3.89 (2.4x). That interfacial-friction gap is not explained by `beta`.
+
+**Pooled SW+ST fit with `beta` threaded through: ONE NN for `f_i_mult`
+plus flat scalars `k_wl`/`k_wg` now fits both regimes (2026-11-23)**
+- `_pooled_sw_st_fit_nn_fi_only_beta.py` (new; original untouched):
+  architecture unchanged from the SW-only "Option B" hybrid
+  (`f_i_mult = softplus(NN(log Re_SL, log Re_SG))`, 2->3 tanh->1, 13
+  weights, with `k_wl`/`k_wg` as plain flat scalars, NOT network outputs
+  -- the choice that avoids the ratio-degeneracy overfit); per-condition
+  `beta` (SW rows 0, ST rows +2 deg); same 44 train / 13 test split
+  (29+15 / 7+6); AdamW lr 0.02, wd 1e-3, 15000 epochs (~2 min, true
+  `jax.grad` through the equilibrium path); warm start = geometric mean
+  of the two individual fits (`f_i_mult` 6.008, `k_wl` 1.594, `k_wg`
+  0.807). Outputs `pooled_beta_result_{base,angle}.pkl`,
+  `pooled_sw_st_nn_fi_only_beta_{base,angle}.eqx`.
+- **Result (2-input "base" variant)**: `k_wl=1.5357, k_wg=0.8567`; train
+  loss 0.019228 (holdup 0.007900, dP/dz 0.011329), test 0.045510
+  (0.025512 / 0.019997). Subset losses: SW train/test 0.0217/0.0224
+  (1.0x), ST 0.0145/0.0725 (5.0x). The NN assigns `f_i_mult` per row:
+  SW median 4.00 (2.42-5.47), ST median 9.22 (4.01-9.22) -- it
+  reproduces the individual fits' regime split (3.9 vs 9.3) without
+  being told which rows are ST; five low-`U_sl` ST rows get SW-like
+  values (4.0-8.3), so it responds to flow conditions, not just a
+  label. Caveat: many ST rows sit at exactly 9.22, so it behaves close
+  to a two-level switch and I would not trust it between the regimes.
+- **Mean errors (equilibrium path, relative, unsigned), pooled NN**:
+  all 57 rows holdup 8.1% / dP/dz 8.5%; train (44) 7.1% / 8.5%; test
+  (13) 11.4% / 8.7%. By subset: SW (36) 6.8% / 9.6%, SW test 6.4% /
+  8.1%; ST (21) 10.2% / 6.7%, ST test (6) holdup 17.2% / dP/dz 9.3%.
+  Pressure gradient generalizes (8.5% train, 8.7% test); the gap is in
+  ST holdup, on 6 rows several of which sit at the coarsely reported
+  `HL=0.01`.
+- **The old pooled fit's strange `k_wg` is explained.** The earlier
+  pooled result (ST fit as horizontal: `k_wl=2.86, k_wg=0.343`, train/
+  test 0.0272/0.0590) had `k_wg` far from both individual fits (~0.84)
+  and the write-up attributed it to the shared `f_i_mult` curve leaving
+  regime mismatch that landed on `k_wg`. With `beta` fixed, `k_wl`/`k_wg`
+  agree with the individual fits (1.536/0.857 vs SW 1.54/0.84 and ST
+  1.65/0.77) -- the missing inclination was the (or a main) cause.
+- **Angle-input variant** (adds `beta` as a third NN input, 16 weights):
+  `k_wl=1.5195, k_wg=0.8666`, train 0.018978, test 0.038055 (ST
+  0.0141/0.0573, 4.1x; SW 0.0215/0.0216), `f_i_mult` SW median 3.91, ST
+  9.16. Small improvement only, and not evidence of a physical angle
+  dependence: `beta` is perfectly collinear with the subset here (only 0
+  and 2 deg exist), and the ST test set is 6 rows. Not run through the
+  dynamic solver.
+- **Dynamic-solver check, both beta-aware closures** (flat ST fit and
+  pooled 2-input NN, all 23 ST rows incl. the 2 without `HL`, production
+  `run_real_data_condition`, N=150, default dt, 150 transits, +2 deg;
+  `_st_closure_stability_check.py`, `st_closure_stability_shard*.pkl`):
+  **0/23 NaN and 0/23 `kh_total>0` for both**, and the dynamic holdup
+  matches each closure's own closed-form equilibrium to <=1e-8 relative.
+  Dynamic holdup error vs measured (21 rows): flat 13.1% (bias -3.1%),
+  pooled NN 10.2% (bias -0.4%); dynamic dP/dz (23 rows): flat 6.6%,
+  pooled NN 7.0% (max 38%, one held-out row at ~83 Pa/m under-predicted).
+  Idx 797 trace (`_st_closure_row797_trace.py`): settles within ~5
+  transits with 0 complex cells at every transit, versus 25-112/150 and
+  a fluctuating outlet holdup for the default closure.
+- **ST-only NN** (`_st_fit_nn_fi_only_beta.py`; SW-only Option B mirrored
+  on the 15 ST train rows, 15 parameters, warm start at the corrected
+  flat ST fit, 5 seeds x 3000 epochs + one 15000-epoch run): overfits.
+  Train 0.0069 (holdup error 4.4%) but test 0.047-0.077 (holdup 15-21%,
+  dP/dz 7.5-7.9%); seed 1 is catastrophic (test loss 256, holdup error
+  669% mean -- one held-out row gets `f_i_mult`~1, i.e. back into the
+  high-holdup unstable branch, ~+4000%); `k_wl`~1.05, `k_wg`~1.14 drift
+  away from the SW/ST values (ratio-degeneracy flavour); 15000 epochs is
+  worse (test 0.0726, `f_i_mult` range 3.0-17.4). Comparators: SW-only NN
+  re-evaluated 0.0208/0.0251 (29 train rows, ratio 1.2x), corrected flat
+  ST 0.0230/0.0628. 15 training rows cannot constrain a 15-parameter NN;
+  the pooled fit works because the 36 SW rows regularize it.
+- **Closure values at a glance** (equilibrium-path fits; also saved as
+  `figures/closure_values_table.png`):
+  ```
+                                f_i_mult                 k_wl   k_wg   train/test loss
+  SW only, flat (36 rows)       3.889                    1.542  0.841  0.0337 / 0.0428
+  SW only, NN f_i_mult          median 5.29 (3.14-6.54)  1.861  0.709  0.0208 / 0.0251
+  ST only, flat, old (beta=0)   10.69                    2.648  0.851  0.0209 / 0.0663 (at beta=0)
+  ST only, flat, beta=+2 deg    9.281                    1.648  0.774  0.0230 / 0.0628
+  ST only, NN (seed 0)          range 2.81-9.08          1.051  1.138  0.0069 / 0.0471
+  Pooled NN, old (beta omitted) n/a (not recorded)       2.86   0.343  0.0272 / 0.0590
+  Pooled NN, beta-aware, 2 in   SW 4.00 / ST 9.22        1.536  0.857  0.0192 / 0.0455
+  Pooled NN, beta-aware, +angle SW 3.91 / ST 9.16        1.520  0.867  0.0190 / 0.0381
+  ```
+  (Losses are on each fit's own rows, so not comparable across groups.)
+- **Roadmap note**: this reaches "Stage 3" of the Forward roadmap
+  (refit on inclination-inclusive Vuong data) by a different route than
+  planned -- surface tension (Stage 2) turned out to be the wrong class
+  of fix, and the inclined rows became usable by calibrating around the
+  instability instead (next entry), with one NN for `f_i_mult` spanning
+  SW and ST. Stage 4 (We-extended, cross-fluid-pair pooling) is untouched.
+- **Open / not done**: dynamic-solver check of the angle variant;
+  leave-one-out CV or a smaller/regularized network for the ST subset; a
+  lower bound on `f_i_mult` to keep an extrapolating NN out of the
+  unstable region (the seed-1 failure); whether the 2.4x `f_i_mult` gap
+  between SW and ST is real physics or compensation; positive angle =
+  uphill is ASSUMED, never checked against the source papers (a wrong
+  sign would be absorbed by the fit); only 21 ST rows have `HL`.
+
+**What the default closure does on the inclined data, what the calibration
+does and does not fix, and how far it can be trusted (visualization
+session, 2026-11-16 to 2026-11-23)**
+- **Vuong ST, default closure (`f_i_mult=k_wl=k_wg=1`), run longer**
+  (`_vuong_st_default_longrun_cache.py`; 23 rows, 0.25x CFL dt because 8
+  of 21 rows NaN at default dt within 10 transits, 50 nominal transits,
+  recorded every transit; no NaN at 0.25x): does NOT settle. Mean error
+  vs measured: outlet-window 63% -> 77% (fluctuating 40-100%; at 50
+  transits 10 rows over, 11 under -- the outlet window is a ~10-cell
+  slice of a wavy field and can land near the data by chance);
+  pipe-mean 86% -> 273% (all 21 rows over-predicted, error GROWS with
+  run time); closed-form equilibrium 1502%. Idx 797: spike trains up to
+  0.7-0.9 persist at 10/25/50 transits, outlet holdup jumps 0.04-0.29,
+  complex cells fluctuate 25-112/150. Contrast with Fan row 0, which
+  converged and held a constant 143/150 complex cells -- so the number of
+  complex cells is not what separates them; steady vs unsteady is.
+- **The closed-form equilibrium is a state the dynamics cannot hold**
+  (`_vuong_st_equilibrium_perturbation_check.py`, idx 797, 0.25x dt):
+  starting from the closed-form uniform state (alpha_l=0.4731) plus 1e-4
+  noise, all 150 cells have complex eigenvalues at t=0, the perturbation
+  grows from 2.4e-4 to ~0.5 by the first printed checkpoint (step 2000 =
+  ~0.8 nominal transits at 0.25x dt; the growth may have happened
+  earlier, the trace was only printed every 2000 steps), and the mean
+  holdup falls to 0.12-0.17 (real inlet BC) / 0.05-0.09 (inlet pinned at
+  the equilibrium, to rule out an entrance layer). Caveats: one row, seed and
+  amplitude; the run covers only 0.38 liquid residence times; short-
+  wavelength growth is unbounded so the evolved state is probably
+  resolution dependent -- do not read the 0.05-0.17 as a physical value.
+- **Closed-form instability criterion** (hand algebra on the Jacobian
+  entries above; `a = dF_alpha/dalpha` equals `d = dF_Delta/dDelta`, so
+  the eigenvalues are `a +- sqrt(b*c)` with `b>0`): the system loses
+  hyperbolicity iff `c = dF_Delta/dalpha < 0`, i.e. `du^2 > (rho_l-rho_g)
+  * g * cos(beta) * (A/S_i) * (alpha/rho_l + alpha_g/rho_g)` -- the
+  classical KH criterion. The slip enters squared because
+  `d(u_l)/d(alpha)=rho_g*du/denom` and `d(u_g)/d(alpha)=rho_l*du/denom`
+  (Venturi response, one `du`) and the kinetic-energy flux multiplies
+  them by `(u_l-u_g)=-du` (the second). Complex eigenvalues give growth
+  rate `k*Im(lambda)` with no preferred wavelength, which is why `k^2`
+  (RS) and `k^3` (surface tension) terms cannot remove it. `0.5*rho*u^2`
+  is a kinetic energy per volume and, numerically, a dynamic pressure
+  (same units). `beta` only enters as `cos(beta)` (~0.9994 at 2 deg).
+- **Hyperbolicity at each closure's own equilibrium** (equilibrium path,
+  23 ST rows, +2 deg): default 23/23 complex; SW production closure
+  6/23; ST-dedicated 0/23 (old and corrected). The 36 Vuong SW rows: 0/36
+  complex even at default (equilibrium holdup 0.023-0.179, mixture
+  velocity only 1.6-4.5 m/s) -- no SW row is anywhere near the unstable
+  region, and none were excluded for instability.
+- **Measured holdup in the ST rows is LOW (0.002-0.076)**, while the
+  default closure predicts 0.34-0.56 there. So the calibrated closures
+  pull the equilibrium TOWARD the data, not away from it. The SW
+  production closure, applied zero-refit to the 21 ST rows with `HL`:
+  +99% mean error on the equilibrium path (range +3% to +284%, rising
+  with holdup; the investigation file's dynamic-solver figure is +79.9%
+  over 20 rows because idx 820/832 misbehave there). Interpretation,
+  flagged as such: the default closure's instability may be mostly a
+  CLOSURE problem (interfacial friction too weak for these conditions
+  puts the model in a regime the real flow never visits) rather than a
+  wrong flux; the data cannot tell real physics (a rough/wavy
+  interface, entrainment) from compensation for something missing, and
+  the calibration does not change the flux, so "friction routes around
+  the instability" (previous entry) still stands as the mechanism.
+- **Would higher-holdup data bring the instability back? Probably, if it
+  also has high slip.** The criterion depends on slip, not holdup alone
+  (Fan inclined rows at default closure are 143/150 complex yet bounded
+  and smooth). But if a future dataset truly sits at high holdup at high
+  gas velocity, a closure that matches it puts the equilibrium back in
+  the unstable region and friction cannot pull it down without
+  contradicting the data. General knowledge, not tested here: loss of
+  hyperbolicity in a two-fluid model is the same KH mechanism usually
+  linked to the stratified->slug transition, so for such data it may
+  mean the flow has left the stratified envelope this 1D model
+  represents (see the "Scope note" in the Long-Term Vision section).
+  Suggested guard, NOT yet built: before running a new dataset, check
+  `is_complex` and the Bernoulli:gravity ratio at the closure's
+  equilibrium for every row (~1 s per row) and flag rows outside the
+  validated envelope.
+- **Vuong data coverage**: the FFPU compilation has 424 `Nitrogen -
+  Isopar L` rows: annular (AN) 262, stratified-wavy+annular (SW&A) 71,
+  SW 36, ST 28, unclassified ("-") 27. Only SW and ST are used. The other
+  360 rows (up to `U_sg`~17 m/s and `U_sl`~0.2, measured `HL` up to
+  0.083) were excluded BY FLOW PATTERN, not by an instability test; whether
+  they would trip the instability is untested (they are annular/mixed, so
+  entrainment and a wall film the model lacks would matter too). The one
+  place instability WAS used to exclude data was the Fan `kh_total>0`
+  rule, now shown to be unnecessary.
+
+**Figures produced in the visualization session** (scripts in
+`vuong_plots/` and `fan_plots/`; every figure script only reads cached
+pickles, so rerunning is instant)
+- `figures/st_instability/` -- default-closure instability on Vuong ST:
+  parity (0.25x dt, and default-dt only, with NaN rows on a strip),
+  idx 797 profile with measured-HL and closed-form lines, hyperbolicity
+  trace, and the three Reynolds-stress overlay figures
+  (`vuong_st_rs_{profile,trace,magnitude}.png`).
+- `figures/fan_incl_instability/` -- Fan inclined rows, 10 vs 150
+  transits: parity, row-0 profile, row-0 trace.
+- `figures/vuong_st_default_longrun/` -- default closure run to 50
+  transits: outlet-window and pipe-mean parity, idx 797 profile/trace,
+  error vs time.
+- `figures/st_calibration/` -- the two beta-aware ST closures under the
+  dynamic solver: parity, error vs holdup, self-consistency, idx 797
+  profile/trace, `f_i_mult` assigned, dP/dz parity.
+- `figures/pooled_nn/` -- pooled NN on its own: holdup and dP/dz for the
+  ST rows (dynamic) and for SW+ST (equilibrium path).
+- `figures/fan_nn_fi_only/` -- regenerated post-fix Fan NN set;
+  `figures/closure_values_table.png` -- the three-row values table.
 
 ### Code Structure
 
@@ -3582,6 +3939,52 @@ vuong_plots/plot_vuong_mdpi_weber.py -- figures/weber_check/*.png
    since they import mixtureTheoryFlow_jax_solver_water_gas.py and each other
    by bare module name and moving them would require sys.path surgery --
 
+-- inclined-flow investigation and the ST / pooled calibrations (2026-11-13
+   to 2026-11-23), see "Inclined-flow investigation, as it stands now...",
+   "`beta` was never passed in the ST-dedicated and pooled fits...", and
+   "Pooled SW+ST fit with `beta` threaded through..." above --
+_st_fit_joint_equilibrium.py       -- first ST-dedicated flat fit; `beta`
+                                       NEVER PASSED (fit as horizontal) --
+                                       superseded, kept as the record
+_st_fit_joint_equilibrium_beta.py  -- corrected ST-dedicated flat fit with
+                                       beta=+2 deg; writes st_fit_beta_result.pkl
+                                       (f_i_mult 9.2809, k_wl 1.6477, k_wg 0.7736)
+_pooled_sw_st_fit_nn_fi_only.py    -- first pooled SW+ST NN fit; same `beta`
+                                       omission for the ST rows -- superseded
+_pooled_sw_st_fit_nn_fi_only_beta.py -- beta-aware pooled NN (argv: base|angle
+                                       [epochs]); writes pooled_beta_result_<tag>.pkl,
+                                       pooled_sw_st_nn_fi_only_beta_<tag>.eqx
+_st_fit_nn_fi_only_beta.py         -- ST-only NN (5 seeds + 15000-epoch run) and a
+                                       like-for-like re-evaluation of the SW-only NN;
+                                       writes st_nn_fi_only_beta_result.pkl
+_st_closure_stability_check.py     -- dynamic-solver check of the flat-ST and pooled-NN
+                                       closures on all 23 ST rows (sharded: <shard>
+                                       <n_shards>); st_closure_stability_shard*.pkl
+_st_closure_row797_trace.py        -- idx 797 profile/trace for both closures;
+                                       st_closure_row797_trace.pkl
+_vuong_st_instability_cache.py     -- default-closure ST data (23 rows, 1.0x and 0.25x
+                                       dt, 10 transits) + idx 797 hyperbolicity trace;
+                                       vuong_st_instability_cache.pkl
+_vuong_st_default_longrun_cache.py -- default closure, 0.25x dt, 50 transits recorded
+                                       per transit (sharded); *_shard*.pkl
+_vuong_st_equilibrium_perturbation_check.py -- starts idx 797 at the closed-form
+                                       equilibrium + noise (real vs pinned inlet);
+                                       vuong_st_eq_perturbation_check.pkl
+_vuong_st_rs_overlay_cache.py      -- Reynolds-stress runs on idx 797 at N=1800
+                                       (uses _reynolds_stress_implicit_test.py);
+                                       vuong_st_rs_overlay_cache.pkl
+_fan_incl_instability_cache.py     -- Fan inclined rows, 10 vs 150 transits (sharded)
+_fan_incl_row0_trace.py            -- Fan row 0 profile/trace to 150 transits
+_fan_eval_nn_checkpoint.py         -- checks plot_fan_nn_fi_only.py's hardcoded table
+                                       against fan_nn_fi_only_best.eqx (read-only)
+vuong_plots/plot_vuong_st_instability.py, plot_vuong_st_rs_overlay.py,
+  plot_vuong_st_default_longrun.py, plot_vuong_st_calibration.py,
+  plot_vuong_st_calibration_dpdz.py, plot_pooled_nn_dpdz.py,
+  plot_pooled_nn_standalone.py, plot_closure_values_table.py,
+fan_plots/plot_fan_incl_instability.py, fan_plots/plot_fan_nn_fi_only.py
+                                    -- figure scripts for the above (they only
+                                       read the cached pickles)
+
 figures/
     f_i_mult_only/   -- holdup/dpdz parity, error-vs-f_i_mult, residual
     k_wall_only/      -- single combined 2x2 figure (not yet split)
@@ -3594,6 +3997,15 @@ figures/
     weber_check/          -- We distribution comparison + factor
                              decomposition bar chart
     stage1/, stage2/    -- the two staged-plan figures and their scripts
+    st_instability/      -- default-closure instability on the inclined
+                           Vuong ST rows + Reynolds-stress overlay
+    fan_incl_instability/ -- Fan inclined rows, 10 vs 150 transit times
+    vuong_st_default_longrun/ -- default closure run to 50 transits
+    st_calibration/      -- the two beta-aware ST closures, dynamic solver
+    pooled_nn/            -- pooled SW+ST NN on its own (holdup, dP/dz)
+    fan_nn_fi_only/       -- regenerated post-fix Fan NN set (older
+                           horizontal-only set in _prev_2026-11-12_...)
+    closure_values_table.png -- SW-only / ST-only / pooled values table
 ```
 
 See "Vuong (2016) joint (f_i_mult, k_wl, k_wg) calibration..." above for
@@ -3628,6 +4040,16 @@ avoid.
   **P=1535.5 kPa (~15.1 atm)** — confirms the facility ran at elevated
   pressure (see "Weber number check..." above), not near-atmospheric like
   MDPI/Carraretto's water-air data.
+  **Update (2026-11-23)**: the full compilation has 424 `Nitrogen -
+  Isopar L` rows by flow pattern: AN 262, SW&A 71, SW 36, ST 28, "-" 27.
+  `vuong2016_sw_subset.csv` is the 36 SW rows (horizontal). The 28 ST rows
+  are all +2 deg and are read straight from the FFPU xlsx (`Flow
+  Pattern=='ST'`, `L=85 m` assumed, positive angle = uphill assumed);
+  23 are the "genuinely high-holdup" rows (default-closure equilibrium
+  0.34-0.56, KH-unstable at default closure), 21 of those have measured
+  `HL` and `dP/dL`, and measured `HL` is only 0.002-0.076. The 360 AN/
+  SW&A/unclassified rows are unused (excluded by flow pattern, untested for
+  instability). See "Pooled SW+ST fit with `beta` threaded through...".
 
 - Fan Y (2005). Horizontal stratified-wavy gas-liquid subset (13
   conditions) pulled from a larger literature compilation
@@ -3637,6 +4059,13 @@ avoid.
   Known Issues, "Vanishing-Phase Singularity Dominates...") — currently a
   dead end for this closure as-is, pending Fan's inclined rows or a
   higher-holdup alternative.
+  **Update (2026-11-23)**: Fan's 47 inclined rows ARE usable (0 NaN; the
+  `kh_total>0` rows settle onto the closed-form equilibrium once run for
+  ~150 transit times); a post-bisection-fix Option B NN fit on 49 rows
+  exists (`fan_nn_fi_only_best.eqx`, test holdup 21.19%) and the figure
+  set was regenerated. Measured `HL` is only reported as 0.01 or 0.02 and
+  34 of the 47 inclined rows have it. See "Inclined-flow investigation,
+  as it stands now...".
 
 - Carraretto M, et al. (2020). Horizontal gas-liquid stratified flow
   study (MDPI), 24m/60mm PMMA air-water test section, digitized from
