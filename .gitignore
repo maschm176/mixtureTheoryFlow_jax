@@ -15,3 +15,6 @@ wallonly_cache/
 # Local Claude Code session/machine state (not project config)
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# Generated figures (regenerate with the plotting scripts in vuong_plots/, fan_plots/, etc.)
+figures/
